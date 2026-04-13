@@ -336,6 +336,11 @@ class RunnerOverlayManager:
         host_gateway = config.host_ip_on_runner_subnet
         self._ensure_overlay_routes(ipr, bridge_idx, host_gateway, config)
 
+        # For non-masquerade networks (public IP), set up policy routing
+        # so ALL outbound traffic from this subnet goes via host (VXLAN → WireGuard)
+        if not config.masquerade:
+            self._setup_policy_routing(config, host_gateway)
+
         # Set up iptables and firewalld rules for overlay forwarding
         self._setup_firewall_rules()
 
@@ -377,6 +382,66 @@ class RunnerOverlayManager:
         except Exception as e:
             # Route may already exist
             logger.debug(f"Overlay route handling: {e}")
+
+    def _setup_policy_routing(
+        self, config: OverlayConfig, host_gateway: str
+    ) -> None:
+        """
+        Set up policy routing for non-masquerade (public IP) networks.
+
+        Without masquerade, outbound traffic from the public subnet must go
+        through the host (via VXLAN) so it exits via the host's WireGuard
+        tunnel with the correct source IP.
+
+        This adds:
+        1. A routing table with default route via host gateway
+        2. An ip rule: traffic FROM this subnet uses that table
+
+        Result: container outbound → runner bridge → VXLAN → host → WireGuard → internet
+        Source IP stays as the public IP (no NAT).
+        """
+        overlay_cidr = config.overlay_network_cidr
+        # Use a stable table ID derived from the network name
+        table_id = 100 + abs(hash(self.network_name)) % 100
+
+        try:
+            # Add default route in the policy table
+            route_cmd = [
+                "ip", "route", "replace", "default",
+                "via", host_gateway,
+                "table", str(table_id),
+            ]
+            subprocess.run(route_cmd, check=True, capture_output=True)
+            logger.info(
+                f"Policy routing table {table_id}: default via {host_gateway}"
+            )
+
+            # Add ip rule: traffic FROM this subnet uses our table
+            # Check if rule already exists
+            check_cmd = ["ip", "rule", "show", "from", overlay_cidr]
+            result = subprocess.run(check_cmd, capture_output=True, text=True)
+            if f"lookup {table_id}" not in result.stdout:
+                rule_cmd = [
+                    "ip", "rule", "add",
+                    "from", overlay_cidr,
+                    "table", str(table_id),
+                ]
+                subprocess.run(rule_cmd, check=True, capture_output=True)
+                logger.info(
+                    f"Policy routing rule: from {overlay_cidr} lookup table {table_id}"
+                )
+            else:
+                logger.debug(
+                    f"Policy routing rule already exists for {overlay_cidr}"
+                )
+
+        except subprocess.CalledProcessError as e:
+            logger.error(
+                f"Failed to set up policy routing for '{self.network_name}': {e}"
+            )
+            logger.warning(
+                f"Containers on '{self.network_name}' may not have outbound connectivity"
+            )
 
     def _setup_firewall_rules(self) -> None:
         """
