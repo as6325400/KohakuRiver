@@ -44,6 +44,8 @@ class OverlayConfig:
     host_ip_on_runner_subnet: str = (
         ""  # Host's IP within this runner's subnet (e.g., 10.128.64.254)
     )
+    network_name: str = "default"  # Network name for multi-network support
+    masquerade: bool = True  # Whether to NAT outbound traffic
 
 
 class RunnerOverlayManager:
@@ -52,23 +54,36 @@ class RunnerOverlayManager:
 
     Creates a VXLAN tunnel to the Host and a Docker network that uses
     the overlay bridge for container networking.
-    """
 
-    # Network configuration
-    BRIDGE_NAME = "kohaku-overlay"
-    VXLAN_NAME = "vxlan0"
-    DOCKER_NETWORK_NAME = "kohakuriver-overlay"
+    In multi-network mode, names are parameterized by network name:
+    - Bridge: kohaku-{name} (e.g., kohaku-private, kohaku-public)
+    - VXLAN: vxlan-{name} (truncated to 15 chars for Linux limit)
+    - Docker: kohakuriver-{name} (e.g., kohakuriver-private)
+    """
 
     def __init__(
         self,
         base_vxlan_id: int = 100,
         vxlan_port: int = 4789,
         mtu: int = 1450,
+        network_name: str = "default",
     ):
         """Initialize runner overlay manager."""
         self.base_vxlan_id = base_vxlan_id
         self.vxlan_port = vxlan_port
         self.mtu = mtu
+        self.network_name = network_name
+
+        # Generate names based on network name
+        if network_name == "default":
+            # Backward compatible names for single-network mode
+            self.BRIDGE_NAME = "kohaku-overlay"
+            self.VXLAN_NAME = "vxlan0"
+            self.DOCKER_NETWORK_NAME = "kohakuriver-overlay"
+        else:
+            self.BRIDGE_NAME = f"kohaku-{network_name}"[:15]
+            self.VXLAN_NAME = f"vxlan-{network_name}"[:15]
+            self.DOCKER_NETWORK_NAME = f"kohakuriver-{network_name}"
 
         self._config: OverlayConfig | None = None
         self._ipr = None
@@ -407,45 +422,56 @@ class RunnerOverlayManager:
                 except subprocess.CalledProcessError as e:
                     logger.warning(f"Failed to add iptables rule {rule}: {e}")
 
-        # Set up NAT/masquerade for external network access
-        # This allows containers to reach the internet through the Runner
-        # Only masquerade traffic going to non-overlay destinations
-        nat_rule = [
-            "-t",
-            "nat",
-            "-A",
-            "POSTROUTING",
-            "-s",
-            overlay_cidr,
-            "!",
-            "-d",
-            overlay_cidr,
-            "-j",
-            "MASQUERADE",
-        ]
-        nat_check = [
-            "-t",
-            "nat",
-            "-C",
-            "POSTROUTING",
-            "-s",
-            overlay_cidr,
-            "!",
-            "-d",
-            overlay_cidr,
-            "-j",
-            "MASQUERADE",
-        ]
+        # Set up NAT/masquerade for external network access (only for private networks)
+        # For public IP networks (masquerade=False), traffic keeps its original source IP
+        if config.masquerade:
+            nat_rule = [
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-s",
+                overlay_cidr,
+                "!",
+                "-d",
+                overlay_cidr,
+                "-j",
+                "MASQUERADE",
+            ]
+            nat_check = [
+                "-t",
+                "nat",
+                "-C",
+                "POSTROUTING",
+                "-s",
+                overlay_cidr,
+                "!",
+                "-d",
+                overlay_cidr,
+                "-j",
+                "MASQUERADE",
+            ]
 
-        try:
-            subprocess.run(["iptables"] + nat_check, check=True, capture_output=True)
-            logger.debug("NAT masquerade rule already exists")
-        except subprocess.CalledProcessError:
             try:
-                subprocess.run(["iptables"] + nat_rule, check=True, capture_output=True)
-                logger.info("Added NAT masquerade rule for external network access")
-            except subprocess.CalledProcessError as e:
-                logger.warning(f"Failed to add NAT masquerade rule: {e}")
+                subprocess.run(
+                    ["iptables"] + nat_check, check=True, capture_output=True
+                )
+                logger.debug("NAT masquerade rule already exists")
+            except subprocess.CalledProcessError:
+                try:
+                    subprocess.run(
+                        ["iptables"] + nat_rule, check=True, capture_output=True
+                    )
+                    logger.info(
+                        "Added NAT masquerade rule for external network access"
+                    )
+                except subprocess.CalledProcessError as e:
+                    logger.warning(f"Failed to add NAT masquerade rule: {e}")
+        else:
+            logger.info(
+                f"Skipping NAT masquerade for network '{self.network_name}' "
+                f"(public IP mode)"
+            )
 
         # Check if firewall-cmd exists and firewalld is running
         if shutil.which("firewall-cmd") is None:
@@ -528,6 +554,10 @@ class RunnerOverlayManager:
         )
         ipam_config = docker.types.IPAMConfig(pool_configs=[ipam_pool])
 
+        # For public IP networks, disable Docker's own masquerade
+        # For private networks, also disable (we handle masquerade ourselves in iptables)
+        enable_masq = "false"
+
         client.networks.create(
             self.DOCKER_NETWORK_NAME,
             driver="bridge",
@@ -537,7 +567,7 @@ class RunnerOverlayManager:
                 "com.docker.network.driver.mtu": str(self.mtu),
                 # Disable iptables isolation to allow VXLAN traffic through bridge
                 "com.docker.network.bridge.enable_icc": "true",
-                "com.docker.network.bridge.enable_ip_masquerade": "false",
+                "com.docker.network.bridge.enable_ip_masquerade": enable_masq,
             },
         )
 

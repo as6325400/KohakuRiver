@@ -246,6 +246,7 @@ def build_docker_run_command(
     env_vars: dict[str, str],
     privileged: bool = False,
     reserved_ip: str | None = None,
+    network_name: str | None = None,
 ) -> list[str]:
     """
     Build a 'docker run --rm' command list for subprocess execution.
@@ -267,6 +268,7 @@ def build_docker_run_command(
         env_vars: Environment variables.
         privileged: Run in privileged mode.
         reserved_ip: Pre-reserved IP address for the container (optional).
+        network_name: Overlay network name to use (optional).
 
     Returns:
         Command list for subprocess execution.
@@ -293,7 +295,7 @@ def build_docker_run_command(
     # Use overlay network if configured, otherwise kohakuriver-net bridge
     # Containers on same node can communicate via container name
     # With overlay, containers across nodes can communicate via overlay IPs
-    container_network = config.get_container_network()
+    container_network = config.get_container_network(network_name)
     docker_cmd.extend(["--network", container_network])
 
     # Assign specific IP if reserved
@@ -554,6 +556,7 @@ async def execute_task(
     task_store: TaskStateStore,
     reserved_ip: str | None = None,
     registry_image: str | None = None,
+    network_name: str | None = None,
 ):
     """
     Execute a task in a Docker container using subprocess.
@@ -664,6 +667,7 @@ async def execute_task(
         env_vars=task_env,
         privileged=config.TASKS_PRIVILEGED,
         reserved_ip=reserved_ip,
+        network_name=network_name,
     )
 
     logger.info(f"[Task {task_id}] Step 2 complete: Task configuration built")

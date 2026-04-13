@@ -18,6 +18,7 @@ import { useNotification } from '@/composables/useNotification'
 
 import GpuSelector from '@/components/common/GpuSelector.vue'
 import IpReservation from '@/components/common/IpReservation.vue'
+import { overlayAPI } from '@/utils/api/overlay'
 
 const props = defineProps({
   visible: {
@@ -56,6 +57,7 @@ const submitForm = ref({
   selectedGpus: {}, // { hostname: [gpu_id1, gpu_id2], ... }
   ip_reservation_token: null, // Token from IP reservation
   target_numa_node_id: null, // NUMA node ID
+  network_name: null, // Overlay network name
 })
 
 // Expanded GPU node panels
@@ -66,6 +68,24 @@ const gpuSelectorRef = ref(null)
 
 // IP Reservation component ref
 const ipReservationRef = ref(null)
+
+// Available overlay networks
+const overlayNetworks = ref([])
+
+// Fetch overlay networks when dialog opens
+watch(
+  () => props.visible,
+  async (visible) => {
+    if (visible) {
+      try {
+        const res = await overlayAPI.getStatus()
+        overlayNetworks.value = res.data?.networks || []
+      } catch {
+        overlayNetworks.value = []
+      }
+    }
+  }
+)
 
 // Argument list drag state
 const draggedArgIndex = ref(null)
@@ -212,6 +232,7 @@ function resetSubmitForm() {
     selectedGpus: {},
     ip_reservation_token: null,
     target_numa_node_id: null,
+    network_name: null,
   }
   expandedGpuNodes.value = []
 }
@@ -356,6 +377,7 @@ function _buildTaskData(instance, targets, requiredGpus) {
     privileged: instance.privileged || null,
     ip_reservation_token: instance.ip_reservation_token || null,
     target_numa_node_id: instance.target_numa_node_id,
+    network_name: instance.network_name || null,
   }
 }
 
@@ -658,11 +680,30 @@ function handleClose() {
         <div class="text-xs text-muted mt-1">Pin task to a specific NUMA node for better memory locality</div>
       </el-form-item>
 
+      <!-- Network Selection -->
+      <el-form-item
+        v-if="overlayNetworks.length > 0"
+        label="Network">
+        <el-select
+          v-model="submitForm.network_name"
+          placeholder="Default (DHCP)"
+          clearable
+          class="w-full">
+          <el-option
+            v-for="net in overlayNetworks"
+            :key="net"
+            :label="net"
+            :value="net" />
+        </el-select>
+        <div class="text-xs text-muted mt-1">Select an overlay network. Leave empty for default.</div>
+      </el-form-item>
+
       <!-- IP Reservation -->
       <el-form-item label="IP Reservation">
         <IpReservation
           ref="ipReservationRef"
           :runner="selectedRunner"
+          :network="submitForm.network_name || 'default'"
           @update:token="handleIpTokenUpdate" />
       </el-form-item>
 

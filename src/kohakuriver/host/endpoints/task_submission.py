@@ -362,7 +362,9 @@ async def _process_target(
             )
 
     # Dispatch to runner
-    runner_response = await _dispatch_task(task, node, req, task_config, reserved_ip)
+    runner_response = await _dispatch_task(
+        task, node, req, task_config, reserved_ip, req.network_name
+    )
 
     if runner_response is False:
         return {"error": "Runner failed to execute task"}
@@ -525,6 +527,7 @@ async def _dispatch_task(
     req: TaskSubmission,
     task_config: dict,
     reserved_ip: str | None = None,
+    network_name: str | None = None,
 ) -> dict | bool | None:
     """Dispatch task to runner node."""
     if req.task_type == "vps":
@@ -535,6 +538,7 @@ async def _dispatch_task(
             ssh_public_key=req.command,
             reserved_ip=reserved_ip,
             registry_image=task_config.get("registry_image"),
+            network_name=network_name,
         )
         if result is None:
             task.status = "failed"
@@ -553,6 +557,7 @@ async def _dispatch_task(
                 working_dir="/shared",
                 reserved_ip=reserved_ip,
                 registry_image=task_config.get("registry_image"),
+                network_name=network_name,
             )
         )
         background_tasks.add(dispatch_task)

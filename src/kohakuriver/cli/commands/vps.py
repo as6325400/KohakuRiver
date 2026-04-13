@@ -210,6 +210,10 @@ def create_vps(
         int | None,
         typer.Option("--vm-memory", help="VM memory in MB (qemu only)"),
     ] = None,
+    network: Annotated[
+        str | None,
+        typer.Option("--network", help="Overlay network name (e.g., private, public)"),
+    ] = None,
 ):
     """Create a new VPS instance.
 
@@ -251,6 +255,7 @@ def create_vps(
             vm_image=vm_image,
             vm_disk_size=vm_disk,
             memory_mb=vm_memory_mb,
+            network_name=network,
         )
 
         if not result.get("task_id"):

@@ -79,6 +79,7 @@ def _build_vps_docker_command(
     gpu_ids: list[int],
     privileged: bool,
     reserved_ip: str | None = None,
+    network_name: str | None = None,
 ) -> list[str]:
     """
     Build docker run command for VPS container.
@@ -95,6 +96,7 @@ def _build_vps_docker_command(
         gpu_ids: List of GPU indices.
         privileged: Run with --privileged.
         reserved_ip: Pre-reserved IP address for the container (optional).
+        network_name: Overlay network name to use (optional).
 
     Returns:
         Docker command as list of strings.
@@ -107,7 +109,7 @@ def _build_vps_docker_command(
     # Use overlay network if configured, otherwise kohakuriver-net bridge
     # Containers on same node can communicate via container name
     # With overlay, containers across nodes can communicate via overlay IPs
-    container_network = config.get_container_network()
+    container_network = config.get_container_network(network_name)
     docker_cmd.extend(["--network", container_network])
 
     # Assign specific IP if reserved
@@ -453,6 +455,7 @@ async def create_vps(
     restore_from_snapshot: bool | None = None,
     reserved_ip: str | None = None,
     registry_image: str | None = None,
+    network_name: str | None = None,
 ) -> dict:
     """
     Create a VPS container with SSH access using subprocess.
@@ -558,6 +561,7 @@ async def create_vps(
         gpu_ids=required_gpus or [],
         privileged=config.TASKS_PRIVILEGED,
         reserved_ip=reserved_ip,
+        network_name=network_name,
     )
 
     try:
