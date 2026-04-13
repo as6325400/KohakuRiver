@@ -236,15 +236,20 @@ class RunnerOverlayManager:
         if vxlan_idx is not None:
             logger.info(f"VXLAN {vxlan_name} already exists, checking config")
 
-            # Verify VNI matches
+            # Verify VNI and remote IP match
             linkinfo = vxlan_link.get_attr("IFLA_LINKINFO") if vxlan_link else None
             if linkinfo:
                 vxlan_data = linkinfo.get_attr("IFLA_INFO_DATA")
                 if vxlan_data:
                     existing_vni = vxlan_data.get_attr("IFLA_VXLAN_ID")
-                    if existing_vni != vni:
+                    existing_remote = vxlan_data.get_attr(
+                        "IFLA_VXLAN_GROUP"
+                    ) or vxlan_data.get_attr("IFLA_VXLAN_REMOTE")
+                    if existing_vni != vni or existing_remote != remote_ip:
                         logger.warning(
-                            f"Existing VXLAN VNI {existing_vni} doesn't match expected {vni}, recreating"
+                            f"Existing VXLAN config mismatch "
+                            f"(vni={existing_vni} vs {vni}, "
+                            f"remote={existing_remote} vs {remote_ip}), recreating"
                         )
                         ipr.link("del", index=vxlan_idx)
                         vxlan_idx = None
