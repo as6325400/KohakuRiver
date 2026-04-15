@@ -106,8 +106,12 @@ def submit_task(
         bool, typer.Option("--wait", "-w", help="Wait for completion")
     ] = False,
     network: Annotated[
-        str | None,
-        typer.Option("--network", "-n", help="Overlay network name (e.g., private, public)"),
+        list[str] | None,
+        typer.Option(
+            "--network",
+            "-n",
+            help="Overlay network name (repeatable for multi-network). First is primary.",
+        ),
     ] = None,
 ):
     """
@@ -161,7 +165,7 @@ def submit_task(
             privileged=privileged if privileged else None,
             additional_mounts=mount,
             gpu_ids=gpu_ids,
-            network_name=network,
+            network_names=network if network else None,
         )
 
         task_ids = result.get("task_ids", [])

@@ -57,7 +57,7 @@ const submitForm = ref({
   selectedGpus: {}, // { hostname: [gpu_id1, gpu_id2], ... }
   ip_reservation_token: null, // Token from IP reservation
   target_numa_node_id: null, // NUMA node ID
-  network_name: null, // Overlay network name
+  network_names: [], // Overlay networks (first is primary). Empty = default
 })
 
 // Expanded GPU node panels
@@ -232,7 +232,7 @@ function resetSubmitForm() {
     selectedGpus: {},
     ip_reservation_token: null,
     target_numa_node_id: null,
-    network_name: null,
+    network_names: [],
   }
   expandedGpuNodes.value = []
 }
@@ -377,7 +377,10 @@ function _buildTaskData(instance, targets, requiredGpus) {
     privileged: instance.privileged || null,
     ip_reservation_token: instance.ip_reservation_token || null,
     target_numa_node_id: instance.target_numa_node_id,
-    network_name: instance.network_name || null,
+    network_names:
+      instance.network_names && instance.network_names.length > 0
+        ? instance.network_names
+        : null,
   }
 }
 
@@ -683,11 +686,13 @@ function handleClose() {
       <!-- Network Selection -->
       <el-form-item
         v-if="overlayNetworks.length > 0"
-        label="Network">
+        label="Networks">
         <el-select
-          v-model="submitForm.network_name"
-          placeholder="Default (DHCP)"
-          clearable
+          v-model="submitForm.network_names"
+          placeholder="Default (first available)"
+          multiple
+          collapse-tags
+          collapse-tags-tooltip
           class="w-full">
           <el-option
             v-for="net in overlayNetworks"
@@ -695,7 +700,9 @@ function handleClose() {
             :label="net"
             :value="net" />
         </el-select>
-        <div class="text-xs text-muted mt-1">Select an overlay network. Leave empty for default.</div>
+        <div class="text-xs text-muted mt-1">
+          Select one or more networks. First = primary (default gateway).
+        </div>
       </el-form-item>
 
       <!-- IP Reservation -->
@@ -703,7 +710,7 @@ function handleClose() {
         <IpReservation
           ref="ipReservationRef"
           :runner="selectedRunner"
-          :network="submitForm.network_name || 'default'"
+          :network="submitForm.network_names?.[0] || 'default'"
           @update:token="handleIpTokenUpdate" />
       </el-form-item>
 

@@ -54,7 +54,7 @@ const createForm = ref({
   gpuFeatureEnabled: false,
   selectedGpus: {}, // { hostname: [gpu_id1, gpu_id2], ... }
   ip_reservation_token: null, // Token from IP reservation
-  network_name: null, // Overlay network name (null = default/DHCP)
+  network_names: [], // Overlay networks (first is primary). Empty = default
   // VM-specific options (qemu backend)
   vm_image: 'ubuntu-24.04',
   vm_disk_size: '500G',
@@ -215,7 +215,7 @@ function buildVpsCreateData(form, targetHostname, requiredGpus) {
     ssh_key_mode: form.ssh_key_mode,
     required_gpus: requiredGpus,
     ip_reservation_token: form.ip_reservation_token || null,
-    network_name: form.network_name || null,
+    network_names: form.network_names && form.network_names.length > 0 ? form.network_names : null,
     // Fields that differ by backend, set below
     required_cores: 0,
     required_memory_bytes: null,
@@ -317,7 +317,7 @@ function resetCreateForm() {
     gpuFeatureEnabled: false,
     selectedGpus: {},
     ip_reservation_token: null,
-    network_name: null,
+    network_names: [],
     vm_image: 'ubuntu-24.04',
     vm_disk_size: '500G',
     vm_memory_mb: 4096,
@@ -549,11 +549,13 @@ function resetCreateForm() {
       <!-- Network Selection -->
       <el-form-item
         v-if="overlayNetworks.length > 0"
-        label="Network">
+        label="Networks">
         <el-select
-          v-model="createForm.network_name"
-          placeholder="Default (DHCP)"
-          clearable
+          v-model="createForm.network_names"
+          placeholder="Default (first available)"
+          multiple
+          collapse-tags
+          collapse-tags-tooltip
           class="w-full">
           <el-option
             v-for="net in overlayNetworks"
@@ -561,7 +563,10 @@ function resetCreateForm() {
             :label="net"
             :value="net" />
         </el-select>
-        <div class="text-xs text-muted mt-1">Select an overlay network for this VPS. Leave empty for default.</div>
+        <div class="text-xs text-muted mt-1">
+          Select one or more networks. First = primary (default gateway).
+          Multiple = container has multiple IPs, one per network.
+        </div>
       </el-form-item>
 
       <!-- IP Reservation -->
@@ -569,7 +574,7 @@ function resetCreateForm() {
         <IpReservation
           ref="ipReservationRef"
           :runner="selectedRunner"
-          :network="createForm.network_name || 'default'"
+          :network="createForm.network_names?.[0] || 'default'"
           @update:token="handleIpTokenUpdate" />
       </el-form-item>
 

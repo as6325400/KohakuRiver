@@ -94,6 +94,7 @@ async def send_vps_to_runner(
     vm_disk_size: str | None = None,
     memory_mb: int | None = None,
     network_name: str | None = None,
+    network_names: list[str] | None = None,
 ) -> dict | None:
     """
     Send VPS creation request to a runner.
@@ -126,6 +127,7 @@ async def send_vps_to_runner(
         "ssh_port": task.ssh_port,
         "vps_backend": vps_backend,
         "network_name": network_name,
+        "network_names": network_names,
     }
 
     # Add VM-specific fields
@@ -472,6 +474,7 @@ async def submit_vps(
         vm_disk_size=submission.vm_disk_size,
         memory_mb=submission.memory_mb,
         network_name=submission.network_name,
+        network_names=submission.network_names,
     )
 
     # Handle runner rejection

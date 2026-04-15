@@ -361,9 +361,14 @@ async def _process_target(
                 expected_runner=target_hostname,
             )
 
+    # Resolve networks: prefer network_names list, fall back to network_name
+    resolved_networks = req.network_names or (
+        [req.network_name] if req.network_name else None
+    )
+
     # Dispatch to runner
     runner_response = await _dispatch_task(
-        task, node, req, task_config, reserved_ip, req.network_name
+        task, node, req, task_config, reserved_ip, req.network_name, resolved_networks
     )
 
     if runner_response is False:
@@ -528,6 +533,7 @@ async def _dispatch_task(
     task_config: dict,
     reserved_ip: str | None = None,
     network_name: str | None = None,
+    network_names: list[str] | None = None,
 ) -> dict | bool | None:
     """Dispatch task to runner node."""
     if req.task_type == "vps":
@@ -539,6 +545,7 @@ async def _dispatch_task(
             reserved_ip=reserved_ip,
             registry_image=task_config.get("registry_image"),
             network_name=network_name,
+            network_names=network_names,
         )
         if result is None:
             task.status = "failed"
@@ -558,6 +565,7 @@ async def _dispatch_task(
                 reserved_ip=reserved_ip,
                 registry_image=task_config.get("registry_image"),
                 network_name=network_name,
+                network_names=network_names,
             )
         )
         background_tasks.add(dispatch_task)

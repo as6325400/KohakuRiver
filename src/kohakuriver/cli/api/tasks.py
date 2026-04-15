@@ -93,6 +93,7 @@ def submit_task(
     additional_mounts: list[str] | None = None,
     gpu_ids: list[list[int]] | None = None,
     network_name: str | None = None,
+    network_names: list[str] | None = None,
 ) -> dict:
     """
     Submit a task and return result dict.
@@ -129,6 +130,7 @@ def submit_task(
         "additional_mounts": additional_mounts,
         "required_gpus": gpu_ids,
         "network_name": network_name,
+        "network_names": network_names,
     }
 
     # Remove None values

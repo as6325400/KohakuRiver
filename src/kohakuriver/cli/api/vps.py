@@ -34,6 +34,7 @@ def create_vps(
     vm_disk_size: str | None = None,
     memory_mb: int | None = None,
     network_name: str | None = None,
+    network_names: list[str] | None = None,
 ) -> dict:
     """
     Create a VPS task.
@@ -84,6 +85,7 @@ def create_vps(
         "required_gpus": gpu_ids if gpu_ids else None,
         "vps_backend": vps_backend,
         "network_name": network_name,
+        "network_names": network_names,
     }
 
     # Add VM-specific fields
