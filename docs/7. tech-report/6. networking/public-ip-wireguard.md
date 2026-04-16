@@ -30,7 +30,7 @@ Internet
 ┌──────────────────┐
 │  KohakuRiver     │  wg0 tunnel, policy routing:
 │  Host            │    from 203.0.113.128/26 → wg0 → VyOS
-│  10.10.10.201    │    to   203.0.113.128/26 → vx11 (VXLAN)
+│  10.10.10.201    │    to   203.0.113.128/26 → vx1_1 (VXLAN)
 └────────┬─────────┘
          │ VXLAN (UDP 4789, VNI 201) on existing internal network
          ▼
@@ -65,7 +65,7 @@ BGP router receives via AS
     │ static route: 203.0.113.128/26 via 172.16.1.3
     ▼ WireGuard (encrypted)
 Host's wg0
-    │ kernel routing: 203.0.113.128/26 dev vx11
+    │ kernel routing: 203.0.113.128/26 dev vx1_1
     ▼ VXLAN (VNI 201)
 Runner's vxlan-public → kohaku-public bridge
     │ L2 switching
@@ -82,7 +82,7 @@ Container (203.0.113.130)
 Runner policy route: from 203.0.113.128/26 → default via 203.0.113.190 (Host on VXLAN)
     │ VXLAN encapsulation
     ▼
-Host's vx11 receives (src=203.0.113.130, dst=internet)
+Host's vx1_1 receives (src=203.0.113.130, dst=internet)
     │ policy rule: from 203.0.113.128/26 → table 200
     │ table 200: default via 172.16.1.1 dev wg0
     ▼ WireGuard (encrypted)
@@ -274,7 +274,7 @@ See [concept.md](concept.md) for dual-NIC architecture details.
 WireGuard's `AllowedIPs` is both a route and ACL. Naively setting `AllowedIPs = 203.0.113.128/26` causes the Host to route **all** traffic for that subnet via wg0 — including traffic that should go over VXLAN to the Runner. This creates a loop (WireGuard delivers the packet to the host, but the host's route sends it right back into wg0).
 
 Solution: `Table = off` disables automatic route addition. The Host then uses:
-- Connected route on `vx11` (VXLAN interface with `203.0.113.190/26`) for Host → Runner
+- Connected route on `vx1_1` (VXLAN interface with `203.0.113.190/26`) for Host → Runner
 - Policy routing table 200 for container outbound → WireGuard
 
 ### No NAT
@@ -291,9 +291,9 @@ All Runners automatically route public subnet traffic via VXLAN to the Host. The
 
 ## Troubleshooting
 
-### Host routing conflict (wg0 vs vx11)
+### Host routing conflict (wg0 vs vx1_1)
 
-Symptom: `ip route get 203.0.113.129` shows `dev wg0` instead of `dev vx11`.
+Symptom: `ip route get 203.0.113.129` shows `dev wg0` instead of `dev vx1_1`.
 
 Cause: `AllowedIPs` in WireGuard config still contains the public subnet, which auto-adds a route via wg0.
 

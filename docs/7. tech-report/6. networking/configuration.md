@@ -152,8 +152,8 @@ With multiple overlays, Host-side VXLAN interfaces use a network-index prefix:
 
 | Network Index | Runner 1 | Runner 2 |
 |---------------|----------|----------|
-| 0 (first network, e.g. `private`) | `vx01` | `vx02` |
-| 1 (second, e.g. `public`) | `vx11` | `vx12` |
+| 0 (first network, e.g. `private`) | `vx0_1` | `vx0_2` |
+| 1 (second, e.g. `public`) | `vx1_1` | `vx1_2` |
 
 Runner-side bridges: `kohaku-{name}` (e.g., `kohaku-private`, `kohaku-public`).
 Runner-side VXLANs: `vxlan-{name}`.

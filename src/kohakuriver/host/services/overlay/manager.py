@@ -113,8 +113,8 @@ class OverlayNetworkManager:
     """
 
     # Device naming: "vxkr{base36_id}" - e.g., "vxkr1", "vxkra" (for id=10)
-    # For multi-network: "vx{net_idx}{base36_id}" - e.g., "vx01", "vx1a"
-    # Linux interface names limited to 15 chars, this scheme uses 4-7 chars max
+    # For multi-network: "vx{net_idx}_{base36_id}" - e.g., "vx0_1", "vx1_a"
+    # Linux interface names limited to 15 chars, this scheme uses 4-8 chars max
     VXLAN_PREFIX = "vxkr"
 
     def __init__(
@@ -153,7 +153,7 @@ class OverlayNetworkManager:
             self.mtu = network_def.mtu
 
             # Use network-specific VXLAN prefix to avoid collisions
-            self.VXLAN_PREFIX = f"vx{self._encode_runner_id(network_index)}"
+            self.VXLAN_PREFIX = f"vx{self._encode_runner_id(network_index)}_"
         else:
             # Legacy single-network mode: use OVERLAY_* config fields
             self.network_name = "default"

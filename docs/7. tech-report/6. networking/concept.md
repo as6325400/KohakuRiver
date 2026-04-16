@@ -130,12 +130,12 @@ The overlay uses a **hub-and-spoke topology** with the Host as the central route
 | Component | Location | Example (first network "private", Runner 1) |
 |-----------|----------|---------------------------------------------|
 | `kohaku-host` | Host | Shared dummy interface (one for all networks) |
-| `vx{net_idx}{runner_id}` | Host | `vx01` — VXLAN prefix encodes network index in base36 |
+| `vx{net_idx}_{runner_id}` | Host | `vx0_1` — VXLAN prefix encodes network index in base36 |
 | `vxlan-{name}` | Runner | `vxlan-private` (truncated to 15 chars) |
 | `kohaku-{name}` | Runner | `kohaku-private` — Linux bridge |
 | `kohakuriver-{name}` | Runner | `kohakuriver-private` — Docker network |
 
-With two networks (e.g., `private` and `public`) and two runners, you get VXLAN devices `vx01`, `vx02` (private network, runners 1-2) and `vx11`, `vx12` (public network). VNIs are `vxlan_id_base + runner_id`, so each network needs a non-overlapping `vxlan_id_base`.
+With two networks (e.g., `private` and `public`) and two runners, you get VXLAN devices `vx0_1`, `vx0_2` (private network, runners 1-2) and `vx1_1`, `vx1_2` (public network). VNIs are `vxlan_id_base + runner_id`, so each network needs a non-overlapping `vxlan_id_base`.
 
 See [configuration.md](configuration.md#multi-overlay-network-configuration) for config details.
 
