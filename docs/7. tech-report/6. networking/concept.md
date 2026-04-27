@@ -337,6 +337,24 @@ For **command tasks** (`docker run --rm`), the additional-network attach happens
 - For workloads that require multi-NIC at startup, prefer **VPS tasks** which use detached containers — the attach completes before any service inside the container would notice (containers typically initialize for several seconds before bringing up listeners).
 - For latency-critical multi-NIC needs, sleep briefly inside your script (e.g., `sleep 2`) before binding, or check with `ip a` for the expected interface.
 
+### Known Limitation: Tunnel Client URL Uses First Overlay's Gateway
+
+The `tunnel-client` injected into containers connects to the runner's WebSocket
+endpoint via the gateway IP. `RunnerConfig.get_runner_ws_url()` calls
+`get_container_gateway()` without a specific `network_name`, so it always
+returns the **first configured overlay's gateway**.
+
+If a container is attached **only to a non-primary overlay** (e.g.
+`network_names=["public"]` with `OVERLAY_NETWORKS = [{name: "private"}, {name: "public"}]`),
+the tunnel-client may target a gateway IP that the container can't reach,
+breaking Web UI terminal/file access for that container.
+
+**Mitigation:**
+- For containers that need tunnel-client (Web UI features), include the
+  cluster's primary network in `network_names` (e.g., dual-NIC: `["private", "public"]`).
+- VPS containers with public-only networking still work for SSH access; only
+  Web UI terminal/file features are affected.
+
 ---
 
 ## Masquerade Modes
