@@ -234,28 +234,65 @@ async def _readopt_running_vm(
 
 
 def _recover_network_allocation(net_manager, task_id: int, task_data: dict) -> None:
-    """Re-register VM network allocation in VMNetworkManager so cleanup works."""
+    """Re-register VM network allocation in VMNetworkManager so cleanup works.
+
+    Reconstructs VMNetworkInfo from persisted state. Multi-NIC VMs persist
+    a full `interfaces` list (added in multi-network support); legacy single-NIC
+    VMs only have flat fields and we synthesize a single interface from them.
+    """
+    from kohakuriver.runner.services.vm_network_manager import VMNetworkInterface
+
     vm_ip = task_data.get("vm_ip", "")
     if not vm_ip:
         return
 
-    info = VMNetworkInfo(
-        tap_device=task_data.get("tap_device", ""),
-        mac_address=task_data.get("mac_address", ""),
-        vm_ip=vm_ip,
-        gateway=task_data.get("gateway", ""),
-        bridge_name=task_data.get("bridge_name", ""),
-        netmask="",  # Not needed for cleanup
-        prefix_len=task_data.get("prefix_len", 24),
-        dns_servers=[],
-        mode=task_data.get("network_mode", "standard"),
-        runner_url="",
-    )
+    persisted_ifaces = task_data.get("interfaces") or []
+    primary_mode = task_data.get("network_mode", "standard")
+
+    if persisted_ifaces:
+        ifaces = [
+            VMNetworkInterface(
+                network_name=iface.get("network_name", "default"),
+                tap_device=iface.get("tap_device", ""),
+                mac_address=task_data.get("mac_address", "")
+                if iface.get("network_name") == persisted_ifaces[0].get("network_name")
+                else "",
+                vm_ip=iface.get("vm_ip", ""),
+                gateway=task_data.get("gateway", ""),
+                bridge_name=iface.get("bridge_name", ""),
+                netmask="",
+                prefix_len=task_data.get("prefix_len", 24),
+                dns_servers=[],
+                mode=iface.get("mode", primary_mode),
+                reservation_token=None,  # Tokens aren't persisted; can't release them
+            )
+            for iface in persisted_ifaces
+        ]
+    else:
+        # Legacy single-NIC VM
+        ifaces = [
+            VMNetworkInterface(
+                network_name="default",
+                tap_device=task_data.get("tap_device", ""),
+                mac_address=task_data.get("mac_address", ""),
+                vm_ip=vm_ip,
+                gateway=task_data.get("gateway", ""),
+                bridge_name=task_data.get("bridge_name", ""),
+                netmask="",
+                prefix_len=task_data.get("prefix_len", 24),
+                dns_servers=[],
+                mode=primary_mode,
+                reservation_token=None,
+            )
+        ]
+
+    info = VMNetworkInfo(interfaces=ifaces, runner_url="")
     net_manager._allocations[task_id] = info
 
-    # Re-register IP in standard mode pool so it doesn't get double-allocated
-    if info.mode == "standard":
-        net_manager._used_local_ips.add(vm_ip)
+    # Re-register standard-mode IPs in the local pool so they don't get reallocated
+    for iface in ifaces:
+        if iface.mode == "standard" and iface.vm_ip:
+            net_manager._used_local_ips.add(iface.vm_ip)
 
 
 async def _cleanup_dead_vm(
@@ -285,9 +322,12 @@ async def _cleanup_dead_vm(
         except ImportError:
             pass
 
-    # Delete TAP device
-    tap = task_data.get("tap_device", "")
-    if tap:
+    # Delete all TAP devices (multi-NIC VMs have multiple)
+    # Falls back to single tap_device for legacy persisted state
+    taps = task_data.get("tap_devices") or [task_data.get("tap_device", "")]
+    for tap in taps:
+        if not tap:
+            continue
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ip",

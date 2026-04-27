@@ -365,22 +365,47 @@ class VMNetworkManager:
             self._allocations[task_id] = info
             return info
 
-        # Overlay mode: resolve network list
-        # No explicit list → fall back to all configured overlays' first one
+        # Overlay mode: resolve network list.
+        # No explicit list → use ONLY the first configured overlay (matches
+        # Docker container behavior where unspecified network defaults to one,
+        # not all). Attaching to every overlay by default would silently
+        # multi-home the VM with extra IPs.
         if not network_names:
-            net_list = config.get_overlay_network_names() or [None]
+            available = config.get_overlay_network_names()
+            net_list = [available[0]] if available else [None]
         else:
             net_list = list(network_names)
 
         interfaces: list[VMNetworkInterface] = []
-        for idx, net_name in enumerate(net_list):
-            iface = await self._create_overlay_interface(
-                task_id,
-                network_name=net_name,
-                network_index=idx,
-                reserved_ip=(reserved_ips or {}).get(net_name) if net_name else None,
+        try:
+            for idx, net_name in enumerate(net_list):
+                iface = await self._create_overlay_interface(
+                    task_id,
+                    network_name=net_name,
+                    network_index=idx,
+                    reserved_ip=(reserved_ips or {}).get(net_name) if net_name else None,
+                )
+                interfaces.append(iface)
+        except Exception:
+            # Roll back any interfaces created before the failure to avoid
+            # leaking TAPs and (un-released) IP reservations.
+            logger.error(
+                f"VM {task_id}: failed to create overlay interface "
+                f"({len(interfaces)} of {len(net_list)} NICs created); rolling back"
             )
-            interfaces.append(iface)
+            for iface in interfaces:
+                try:
+                    await asyncio.to_thread(self._delete_tap_sync, iface.tap_device)
+                except Exception as e:
+                    logger.warning(f"VM {task_id}: rollback delete TAP failed: {e}")
+                if iface.reservation_token:
+                    try:
+                        await self._release_overlay_ip_token(iface.reservation_token)
+                    except Exception as e:
+                        logger.warning(
+                            f"VM {task_id}: rollback release IP token failed: {e}"
+                        )
+            raise
 
         primary = interfaces[0]
         info = VMNetworkInfo(
