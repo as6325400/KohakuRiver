@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import textwrap
 import yaml
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from kohakuriver.qemu.exceptions import CloudInitError
 from kohakuriver.utils.logger import get_logger
@@ -21,20 +21,61 @@ logger = get_logger(__name__)
 
 
 @dataclass
-class CloudInitConfig:
-    """Cloud-init configuration."""
+class CloudInitNIC:
+    """A single network interface for cloud-init."""
 
-    task_id: int
-    hostname: str
     mac_address: str
     vm_ip: str
     gateway: str
     prefix_len: int
     dns_servers: list[str]
+    is_primary: bool = False  # Only the primary interface gets the default route
+
+
+@dataclass
+class CloudInitConfig:
+    """Cloud-init configuration.
+
+    For multi-NIC, populate `nics` with all interfaces (first = primary).
+    The legacy single-NIC fields (mac_address, vm_ip, gateway, prefix_len,
+    dns_servers) are derived from the primary if `nics` is set, or used
+    directly if `nics` is empty.
+    """
+
+    task_id: int
+    hostname: str
     ssh_public_key: str
     runner_url: str
     runner_public_key: str = ""
     nvidia_driver_version: str | None = None
+
+    # Multi-NIC support; list[0] is primary
+    nics: list[CloudInitNIC] = field(default_factory=list)
+
+    # Legacy single-NIC fields (used when `nics` is empty)
+    mac_address: str = ""
+    vm_ip: str = ""
+    gateway: str = ""
+    prefix_len: int = 0
+    dns_servers: list[str] = field(default_factory=list)
+
+    def get_nics(self) -> list[CloudInitNIC]:
+        """Return the NIC list, synthesizing from legacy fields if needed."""
+        if self.nics:
+            return self.nics
+        return [
+            CloudInitNIC(
+                mac_address=self.mac_address,
+                vm_ip=self.vm_ip,
+                gateway=self.gateway,
+                prefix_len=self.prefix_len,
+                dns_servers=self.dns_servers,
+                is_primary=True,
+            )
+        ]
+
+    def get_primary(self) -> CloudInitNIC:
+        return self.get_nics()[0]
 
 
 # Embedded VM agent script (runs inside VM, reports status to runner)
@@ -375,23 +416,31 @@ def build_user_data(config: CloudInitConfig) -> str:
 
 
 def build_network_config(config: CloudInitConfig) -> str:
-    """Generate network-config for static IP.
+    """Generate network-config for static IPs (multi-NIC supported).
 
     Uses MAC address matching instead of a hardcoded device name
     to avoid issues with PCI-based naming (enp0s2, ens3, etc.).
     Uses 'routes' instead of deprecated 'gateway4'.
+
+    Only the primary NIC (first in nics list, or is_primary=True) gets the
+    default route. Additional NICs only get the IP/netmask, so they're
+    addressable but the VM's default route stays on the primary.
     """
-    net_config = {
-        "version": 2,
-        "ethernets": {
-            "vmnic0": {
-                "match": {"macaddress": config.mac_address},
-                "addresses": [f"{config.vm_ip}/{config.prefix_len}"],
-                "routes": [{"to": "default", "via": config.gateway}],
-                "nameservers": {"addresses": config.dns_servers},
-            }
-        },
-    }
+    ethernets: dict[str, dict] = {}
+    nics = config.get_nics()
+    for i, nic in enumerate(nics):
+        is_primary = nic.is_primary or i == 0
+        entry: dict = {
+            "match": {"macaddress": nic.mac_address},
+            "addresses": [f"{nic.vm_ip}/{nic.prefix_len}"],
+        }
+        if is_primary:
+            entry["routes"] = [{"to": "default", "via": nic.gateway}]
+            if nic.dns_servers:
+                entry["nameservers"] = {"addresses": nic.dns_servers}
+        ethernets[f"vmnic{i}"] = entry
+
+    net_config = {"version": 2, "ethernets": ethernets}
     return yaml.dump(net_config, default_flow_style=False)
 
 

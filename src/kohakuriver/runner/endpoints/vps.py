@@ -152,6 +152,11 @@ async def _create_vm_vps(request: VPSCreateRequest):
         f"{memory_mb}MB RAM, image={vm_image}, disk={disk_size}"
     )
 
+    # Resolve networks: prefer network_names list, fall back to network_name
+    resolved_networks = request.network_names or (
+        [request.network_name] if request.network_name else None
+    )
+
     result = await create_vm_vps(
         task_id=task_id,
         vm_image=vm_image,
@@ -162,6 +167,8 @@ async def _create_vm_vps(request: VPSCreateRequest):
         ssh_public_key=request.ssh_public_key,
         ssh_port=request.ssh_port,
         task_store=task_store,
+        network_names=resolved_networks,
+        reserved_ips=request.reserved_ips,
     )
 
     if not result.get("success"):

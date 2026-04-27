@@ -30,36 +30,102 @@ from kohakuriver.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-def _tap_name(task_id: int) -> str:
-    """Generate a short TAP device name (max 15 chars for Linux IFNAMSIZ)."""
-    h = hashlib.sha3_224(str(task_id).encode()).hexdigest()[:8]
-    return f"tap-{h}"
+def _tap_name(task_id: int, suffix: str = "") -> str:
+    """Generate a short TAP device name (max 15 chars for Linux IFNAMSIZ).
+
+    Multi-NIC: suffix differentiates interfaces (e.g., empty for primary,
+    '-1', '-2' for additional). Total length stays <= 15 chars.
+    """
+    h = hashlib.sha3_224(str(task_id).encode()).hexdigest()[:7]
+    return f"tap-{h}{suffix}"
 
 
-def _generate_mac(task_id: int) -> str:
-    """Generate a deterministic MAC address from task_id.
+def _generate_mac(task_id: int, network_index: int = 0) -> str:
+    """Generate a deterministic MAC address from task_id and NIC index.
 
     Uses QEMU's locally-administered range (52:54:00:xx:xx:xx).
+    Different NICs on the same VM get different MACs by hashing in
+    the network_index.
     """
-    h = hashlib.sha3_224(str(task_id).encode()).digest()
+    h = hashlib.sha3_224(f"{task_id}:{network_index}".encode()).digest()
     return f"52:54:00:{h[0]:02x}:{h[1]:02x}:{h[2]:02x}"
 
 
 @dataclass
-class VMNetworkInfo:
-    """Network configuration for a VM."""
+class VMNetworkInterface:
+    """A single network interface attached to a VM."""
 
+    network_name: str  # Overlay network name (e.g., "private", "public") or "standard"
     tap_device: str  # e.g., "tap-a1b2c3d4"
     mac_address: str  # e.g., "52:54:00:ab:cd:ef"
-    vm_ip: str  # e.g., "10.128.64.5" or "10.200.0.10"
-    gateway: str  # e.g., "10.128.64.1" or "10.200.0.1"
-    bridge_name: str  # e.g., "kohaku-overlay" or "kohaku-br0"
-    netmask: str  # e.g., "255.255.192.0" or "255.255.255.0"
-    prefix_len: int  # e.g., 18 or 24
-    dns_servers: list[str]  # e.g., ["8.8.8.8", "8.8.4.4"]
+    vm_ip: str  # e.g., "10.128.64.5"
+    gateway: str  # e.g., "10.128.64.1"
+    bridge_name: str  # e.g., "kohaku-private" or "kohaku-br0"
+    netmask: str
+    prefix_len: int
+    dns_servers: list[str]
     mode: str  # "overlay" or "standard"
-    runner_url: str  # URL for VM agent to reach runner
-    reservation_token: str | None = None  # Overlay mode: IP reservation token
+    reservation_token: str | None = None  # Overlay only; for release
+
+
+@dataclass
+class VMNetworkInfo:
+    """Network configuration for a VM (one or more interfaces).
+
+    The first interface is the primary (default route, runner_url anchor).
+    Additional interfaces are attached but don't override the default route.
+
+    Backward-compatible accessors (tap_device, mac_address, vm_ip, etc.)
+    return the primary interface's fields so older code keeps working.
+    """
+
+    interfaces: list[VMNetworkInterface]
+    runner_url: str  # URL for VM agent to reach runner (uses primary gateway)
+
+    @property
+    def primary(self) -> VMNetworkInterface:
+        return self.interfaces[0]
+
+    # --- Backward-compat single-NIC accessors ---
+    @property
+    def tap_device(self) -> str:
+        return self.primary.tap_device
+
+    @property
+    def mac_address(self) -> str:
+        return self.primary.mac_address
+
+    @property
+    def vm_ip(self) -> str:
+        return self.primary.vm_ip
+
+    @property
+    def gateway(self) -> str:
+        return self.primary.gateway
+
+    @property
+    def bridge_name(self) -> str:
+        return self.primary.bridge_name
+
+    @property
+    def netmask(self) -> str:
+        return self.primary.netmask
+
+    @property
+    def prefix_len(self) -> int:
+        return self.primary.prefix_len
+
+    @property
+    def dns_servers(self) -> list[str]:
+        return self.primary.dns_servers
+
+    @property
+    def mode(self) -> str:
+        return self.primary.mode
+
+    @property
+    def reservation_token(self) -> str | None:
+        return self.primary.reservation_token
 
 
 class VMNetworkManager:
@@ -268,54 +334,121 @@ class VMNetworkManager:
     # VM Network Lifecycle
     # =========================================================================
 
-    async def create_vm_network(self, task_id: int) -> VMNetworkInfo:
+    async def create_vm_network(
+        self,
+        task_id: int,
+        network_names: list[str] | None = None,
+        reserved_ips: dict[str, str] | None = None,
+    ) -> VMNetworkInfo:
         """
         Create network for a VM. Returns VMNetworkInfo.
 
-        Overlay: create TAP -> attach to kohaku-overlay -> reserve IP from host
-        Standard: create TAP -> attach to kohaku-br0 -> allocate from local pool
+        Args:
+            task_id: VM task ID.
+            network_names: Overlay networks to attach. First is primary
+                (default gateway). If None and overlay enabled, uses the
+                first configured overlay (legacy behavior). If None and
+                overlay disabled, uses the standard NAT bridge.
+            reserved_ips: {network_name: ip} pre-allocated by host. The VM
+                gets these specific IPs in cloud-init.
+
+        Behavior:
+        - Overlay mode (per-network): create TAP per network -> attach to that
+          network's bridge. If reserved_ips has the IP, use it directly;
+          otherwise reserve from host IPAM.
+        - Standard mode (single NIC fallback): create TAP -> attach to
+          kohaku-br0 -> allocate from local pool.
         """
-        if self._is_overlay:
-            info = await self._create_overlay_vm_network(task_id)
-        else:
+        # Standard mode: legacy single-NIC path
+        if not self._is_overlay:
             info = await asyncio.to_thread(self._create_standard_vm_network, task_id)
+            self._allocations[task_id] = info
+            return info
+
+        # Overlay mode: resolve network list
+        # No explicit list → fall back to all configured overlays' first one
+        if not network_names:
+            net_list = config.get_overlay_network_names() or [None]
+        else:
+            net_list = list(network_names)
+
+        interfaces: list[VMNetworkInterface] = []
+        for idx, net_name in enumerate(net_list):
+            iface = await self._create_overlay_interface(
+                task_id,
+                network_name=net_name,
+                network_index=idx,
+                reserved_ip=(reserved_ips or {}).get(net_name) if net_name else None,
+            )
+            interfaces.append(iface)
+
+        primary = interfaces[0]
+        info = VMNetworkInfo(
+            interfaces=interfaces,
+            runner_url=f"http://{primary.gateway}:{config.RUNNER_PORT}",
+        )
         self._allocations[task_id] = info
         return info
 
     async def cleanup_vm_network(self, task_id: int) -> None:
-        """Remove TAP device and release IP."""
+        """Remove all TAP devices and release IPs for the VM."""
         info = self._allocations.pop(task_id, None)
         if info is None:
             return
-        await asyncio.to_thread(self._delete_tap_sync, info.tap_device)
-        if info.mode == "overlay":
-            await self._release_overlay_ip(info)
-        else:
-            self._release_local_ip(info.vm_ip)
+        for iface in info.interfaces:
+            await asyncio.to_thread(self._delete_tap_sync, iface.tap_device)
+            if iface.mode == "overlay":
+                if iface.reservation_token:
+                    await self._release_overlay_ip_token(iface.reservation_token)
+            else:
+                self._release_local_ip(iface.vm_ip)
 
     # =========================================================================
     # Overlay mode: TAP -> kohaku-overlay, IP from host IPReservationManager
     # =========================================================================
 
-    async def _create_overlay_vm_network(self, task_id: int) -> VMNetworkInfo:
+    async def _create_overlay_interface(
+        self,
+        task_id: int,
+        network_name: str | None,
+        network_index: int,
+        reserved_ip: str | None = None,
+    ) -> VMNetworkInterface:
         """
-        Reserve IP from host, create TAP on kohaku-overlay bridge.
+        Create one overlay-network interface for a VM.
 
-        Uses same IPReservationManager API as Docker containers.
+        If reserved_ip is provided (from host pre-allocation), use it directly
+        and skip the host reservation API call. Otherwise, reserve from host
+        IPAM via HTTP.
         """
-        vm_ip, token = await self._reserve_overlay_ip(task_id)
-        tap_name = _tap_name(task_id)
-        mac = _generate_mac(task_id)
-        bridge = RunnerOverlayManager.BRIDGE_NAME  # "kohaku-overlay"
+        token: str | None = None
+        if reserved_ip:
+            vm_ip = reserved_ip
+        else:
+            vm_ip, token = await self._reserve_overlay_ip(task_id, network_name)
+
+        tap_suffix = f"-{network_index}" if network_index > 0 else ""
+        tap_name = _tap_name(task_id, suffix=tap_suffix)
+        mac = _generate_mac(task_id, network_index=network_index)
+
+        # Resolve bridge for this network. None → legacy default overlay bridge.
+        if network_name:
+            bridge = f"kohaku-{network_name}" if network_name != "default" else RunnerOverlayManager.BRIDGE_NAME
+            gateway = config.get_container_gateway(network_name)
+        else:
+            bridge = RunnerOverlayManager.BRIDGE_NAME
+            gateway = config._overlay_gateway
+
         await asyncio.to_thread(self._create_tap_sync, tap_name, bridge)
 
-        gateway = config._overlay_gateway
-        # Derive prefix from overlay subnet config
-        subnet_cfg = OverlaySubnetConfig.parse(config.OVERLAY_SUBNET)
-        prefix_len = subnet_cfg.runner_prefix
+        # Derive prefix from the bridge's IP / subnet
+        prefix_len = await asyncio.to_thread(
+            self._get_bridge_prefix_sync, bridge, gateway
+        )
         network = ipaddress.IPv4Network(f"{gateway}/{prefix_len}", strict=False)
 
-        return VMNetworkInfo(
+        return VMNetworkInterface(
+            network_name=network_name or "default",
             tap_device=tap_name,
             mac_address=mac,
             vm_ip=vm_ip,
@@ -325,20 +458,43 @@ class VMNetworkManager:
             prefix_len=prefix_len,
             dns_servers=self.DNS_SERVERS,
             mode="overlay",
-            runner_url=f"http://{gateway}:{config.RUNNER_PORT}",
             reservation_token=token,
         )
 
-    async def _reserve_overlay_ip(self, task_id: int) -> tuple[str, str]:
+    def _get_bridge_prefix_sync(self, bridge_name: str, gateway: str) -> int:
+        """Read the prefix length from the bridge's assigned IP."""
+        from pyroute2 import IPRoute
+
+        ipr = IPRoute()
+        try:
+            for link in ipr.get_links():
+                if link.get_attr("IFLA_IFNAME") != bridge_name:
+                    continue
+                idx = link["index"]
+                for addr in ipr.get_addr(index=idx):
+                    if addr.get_attr("IFA_ADDRESS") == gateway:
+                        return addr["prefixlen"]
+            # Fallback: parse from overlay subnet config
+            subnet_cfg = OverlaySubnetConfig.parse(config.OVERLAY_SUBNET)
+            return subnet_cfg.runner_prefix
+        finally:
+            ipr.close()
+
+    async def _reserve_overlay_ip(
+        self, task_id: int, network_name: str | None = None
+    ) -> tuple[str, str]:
         """Reserve IP from host's IPReservationManager via HTTP API."""
         hostname = await asyncio.to_thread(socket.gethostname)
         host_url = config.get_host_url()
+        params = {"runner": hostname, "ttl": 1800}
+        if network_name:
+            params["network"] = network_name
 
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     f"{host_url}/api/overlay/ip/reserve",
-                    params={"runner": hostname, "ttl": 1800},
+                    params=params,
                     timeout=15.0,
                 )
                 response.raise_for_status()
@@ -347,35 +503,33 @@ class VMNetworkManager:
         except Exception as e:
             raise RuntimeError(f"Failed to reserve overlay IP: {e}")
 
-    async def _release_overlay_ip(self, info: VMNetworkInfo) -> None:
+    async def _release_overlay_ip_token(self, token: str) -> None:
         """Release overlay IP via host API using reservation token."""
-        if not info.reservation_token:
-            return
-
         host_url = config.get_host_url()
         try:
             async with httpx.AsyncClient() as client:
                 await client.post(
                     f"{host_url}/api/overlay/ip/release",
-                    params={"token": info.reservation_token},
+                    params={"token": token},
                     timeout=10.0,
                 )
         except Exception as e:
-            logger.warning(f"Failed to release overlay IP {info.vm_ip}: {e}")
+            logger.warning(f"Failed to release overlay IP token: {e}")
 
     # =========================================================================
     # Standard mode: TAP -> kohaku-br0, IP from local 10.200.0.0/24 pool
     # =========================================================================
 
     def _create_standard_vm_network(self, task_id: int) -> VMNetworkInfo:
-        """Allocate local IP, create TAP on kohaku-br0."""
+        """Allocate local IP, create TAP on kohaku-br0 (single-NIC fallback)."""
         vm_ip = self._allocate_local_ip()
         tap_name = _tap_name(task_id)
         mac = _generate_mac(task_id)
         self._create_tap_sync(tap_name, config.VM_BRIDGE_NAME)
         network = ipaddress.IPv4Network(config.VM_BRIDGE_SUBNET)
 
-        return VMNetworkInfo(
+        iface = VMNetworkInterface(
+            network_name="standard",
             tap_device=tap_name,
             mac_address=mac,
             vm_ip=vm_ip,
@@ -385,6 +539,9 @@ class VMNetworkManager:
             prefix_len=self.NAT_PREFIX,
             dns_servers=self.DNS_SERVERS,
             mode="standard",
+        )
+        return VMNetworkInfo(
+            interfaces=[iface],
             runner_url=f"http://{config.VM_BRIDGE_GATEWAY}:{config.RUNNER_PORT}",
         )
 

@@ -40,16 +40,30 @@ logger = get_logger(__name__)
 
 
 @dataclass
+class VMNetworkSpec:
+    """One network interface spec for a VM."""
+
+    tap_device: str
+    mac_address: str
+    vm_ip: str
+    gateway: str
+    prefix_len: int
+    dns_servers: list[str] = field(default_factory=list)
+
+
+@dataclass
 class VMInstance:
     """Running VM instance state."""
 
     task_id: int
     pid: int
-    vm_ip: str
-    tap_device: str
+    vm_ip: str  # Primary IP (backward compat)
+    tap_device: str  # Primary TAP (backward compat)
     gpu_pci_addresses: list[str]
     instance_dir: str
     qmp_socket: str
+    # All TAP devices (for multi-NIC cleanup). Includes primary.
+    tap_devices: list[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
 
     # QEMU command line (saved for restart)
@@ -64,7 +78,12 @@ class VMInstance:
 
 @dataclass
 class VMCreateOptions:
-    """Options for VM creation."""
+    """Options for VM creation.
+
+    Multi-NIC support: populate `network_interfaces` for multiple NICs.
+    The legacy single-NIC fields (mac_address, vm_ip, tap_device, etc.)
+    are used as the primary if `network_interfaces` is empty.
+    """
 
     task_id: int
     base_image: str
@@ -73,16 +92,36 @@ class VMCreateOptions:
     disk_size: str
     gpu_pci_addresses: list[str]
     ssh_public_key: str
-    mac_address: str
-    vm_ip: str
-    tap_device: str
-    gateway: str
-    prefix_len: int
-    dns_servers: list[str]
     runner_url: str
     runner_public_key: str = ""
     shared_dir_host: str = ""  # Host path for /shared (empty = skip)
     local_temp_dir_host: str = ""  # Host path for /local_temp (empty = skip)
+
+    # Multi-NIC; index 0 = primary
+    network_interfaces: list[VMNetworkSpec] = field(default_factory=list)
+
+    # Legacy single-NIC fields (used when network_interfaces is empty)
+    mac_address: str = ""
+    vm_ip: str = ""
+    tap_device: str = ""
+    gateway: str = ""
+    prefix_len: int = 0
+    dns_servers: list[str] = field(default_factory=list)
+
+    def get_interfaces(self) -> list[VMNetworkSpec]:
+        """Return NIC list, synthesizing from legacy fields if needed."""
+        if self.network_interfaces:
+            return self.network_interfaces
+        return [
+            VMNetworkSpec(
+                tap_device=self.tap_device,
+                mac_address=self.mac_address,
+                vm_ip=self.vm_ip,
+                gateway=self.gateway,
+                prefix_len=self.prefix_len,
+                dns_servers=self.dns_servers,
+            )
+        ]
 
 
 class QEMUManager:
@@ -161,18 +200,27 @@ class QEMUManager:
                     bound_devices.update(group_bound)
 
             cloud_init_path = vm_cloud_init_path(instance_dir)
+            from kohakuriver.qemu.cloud_init import CloudInitNIC
+
+            nics_for_ci = [
+                CloudInitNIC(
+                    mac_address=nic.mac_address,
+                    vm_ip=nic.vm_ip,
+                    gateway=nic.gateway,
+                    prefix_len=nic.prefix_len,
+                    dns_servers=nic.dns_servers,
+                    is_primary=(i == 0),
+                )
+                for i, nic in enumerate(options.get_interfaces())
+            ]
             ci_config = CloudInitConfig(
                 task_id=options.task_id,
                 hostname=vm_name(options.task_id),
-                mac_address=options.mac_address,
-                vm_ip=options.vm_ip,
-                gateway=options.gateway,
-                prefix_len=options.prefix_len,
-                dns_servers=options.dns_servers,
                 ssh_public_key=options.ssh_public_key,
                 runner_public_key=options.runner_public_key,
                 runner_url=options.runner_url,
                 nvidia_driver_version=nvidia_driver_version,
+                nics=nics_for_ci,
             )
             await create_cloud_init_iso(cloud_init_path, ci_config)
 
@@ -233,11 +281,14 @@ class QEMUManager:
                 )
 
             # Step 6: Track VM instance
+            ifaces = options.get_interfaces()
+            primary_nic = ifaces[0]
             vm = VMInstance(
                 task_id=options.task_id,
                 pid=pid,
-                vm_ip=options.vm_ip,
-                tap_device=options.tap_device,
+                vm_ip=primary_nic.vm_ip,
+                tap_device=primary_nic.tap_device,
+                tap_devices=[nic.tap_device for nic in ifaces],
                 gpu_pci_addresses=options.gpu_pci_addresses,
                 instance_dir=instance_dir,
                 qmp_socket=qmp_socket,
@@ -456,6 +507,7 @@ class QEMUManager:
             pid=new_pid,
             vm_ip=vm.vm_ip,
             tap_device=vm.tap_device,
+            tap_devices=vm.tap_devices,
             gpu_pci_addresses=gpu_pci_addresses,
             instance_dir=instance_dir,
             qmp_socket=vm.qmp_socket,
@@ -513,11 +565,15 @@ class QEMUManager:
             return None
 
         qmp_socket = vm_qmp_socket_path(task_id)
+        primary_tap = vm_data.get("tap_device", "")
+        # tap_devices added in multi-NIC support; fall back to primary for old data
+        all_taps = vm_data.get("tap_devices") or ([primary_tap] if primary_tap else [])
         vm = VMInstance(
             task_id=task_id,
             pid=pid,
             vm_ip=vm_data.get("vm_ip", ""),
-            tap_device=vm_data.get("tap_device", ""),
+            tap_device=primary_tap,
+            tap_devices=all_taps,
             gpu_pci_addresses=vm_data.get("gpu_pci_addresses", []),
             instance_dir=instance_dir,
             qmp_socket=qmp_socket,
@@ -666,11 +722,22 @@ class QEMUManager:
                 # Cloud-init ISO
                 "-drive",
                 f"file={cloud_init_iso},format=raw,if=virtio,media=cdrom,readonly=on",
-                # Network: TAP device
-                "-netdev",
-                f"tap,id=net0,ifname={options.tap_device},script=no,downscript=no",
-                "-device",
-                f"virtio-net-pci,netdev=net0,mac={options.mac_address}",
+            ]
+        )
+
+        # Network: one -netdev/-device pair per NIC
+        for i, nic in enumerate(options.get_interfaces()):
+            cmd.extend(
+                [
+                    "-netdev",
+                    f"tap,id=net{i},ifname={nic.tap_device},script=no,downscript=no",
+                    "-device",
+                    f"virtio-net-pci,netdev=net{i},mac={nic.mac_address}",
+                ]
+            )
+
+        cmd.extend(
+            [
                 # QMP control socket
                 "-qmp",
                 f"unix:{qmp_socket},server,nowait",

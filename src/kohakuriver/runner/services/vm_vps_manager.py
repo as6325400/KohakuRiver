@@ -13,6 +13,7 @@ import time as _time
 
 from kohakuriver.models.requests import TaskStatusUpdate
 from kohakuriver.qemu import VMCreateOptions, get_qemu_manager, get_vm_capability
+from kohakuriver.qemu.client import VMNetworkSpec
 from kohakuriver.qemu.capability import GPUInfo
 from kohakuriver.qemu.naming import vm_instance_dir
 from kohakuriver.runner.config import config
@@ -114,6 +115,18 @@ def _build_vm_create_options(
     local_temp_host = os.path.join(config.LOCAL_TEMP_DIR, str(task_id))
     os.makedirs(local_temp_host, exist_ok=True)
 
+    network_specs = [
+        VMNetworkSpec(
+            tap_device=iface.tap_device,
+            mac_address=iface.mac_address,
+            vm_ip=iface.vm_ip,
+            gateway=iface.gateway,
+            prefix_len=iface.prefix_len,
+            dns_servers=iface.dns_servers,
+        )
+        for iface in net_info.interfaces
+    ]
+
     return VMCreateOptions(
         task_id=task_id,
         base_image=vm_image,
@@ -123,15 +136,10 @@ def _build_vm_create_options(
         gpu_pci_addresses=gpu_pci_addresses,
         ssh_public_key=ssh_public_key or "",
         runner_public_key=runner_pubkey,
-        mac_address=net_info.mac_address,
-        vm_ip=net_info.vm_ip,
-        tap_device=net_info.tap_device,
-        gateway=net_info.gateway,
-        prefix_len=net_info.prefix_len,
-        dns_servers=net_info.dns_servers,
         runner_url=net_info.runner_url,
         shared_dir_host=shared_host,
         local_temp_dir_host=local_temp_host,
+        network_interfaces=network_specs,
     )
 
 
@@ -158,7 +166,7 @@ def _persist_vm_task_state(
         "allocated_cores": cores,
         "allocated_gpus": gpu_ids or [],
         "numa_node": None,
-        # VM recovery fields
+        # VM recovery fields (primary NIC, for backward compat)
         "vm_ip": net_info.vm_ip,
         "tap_device": net_info.tap_device,
         "mac_address": net_info.mac_address,
@@ -168,6 +176,18 @@ def _persist_vm_task_state(
         "gateway": net_info.gateway,
         "prefix_len": net_info.prefix_len,
         "ssh_port": ssh_port,
+        # Multi-NIC: full interface list for cleanup
+        "tap_devices": [iface.tap_device for iface in net_info.interfaces],
+        "interfaces": [
+            {
+                "network_name": iface.network_name,
+                "tap_device": iface.tap_device,
+                "vm_ip": iface.vm_ip,
+                "bridge_name": iface.bridge_name,
+                "mode": iface.mode,
+            }
+            for iface in net_info.interfaces
+        ],
     }
     task_store[str(task_id)] = state_data
 
@@ -244,6 +264,8 @@ async def create_vm_vps(
     ssh_public_key: str | None,
     ssh_port: int | None,
     task_store: TaskStateStore,
+    network_names: list[str] | None = None,
+    reserved_ips: dict[str, str] | None = None,
 ) -> dict:
     """
     Create a VM VPS instance.
@@ -292,12 +314,17 @@ async def create_vm_vps(
             else []
         )
 
-        # Setup network
+        # Setup network (multi-NIC if network_names is provided)
         net_manager = get_vm_network_manager()
-        net_info = await net_manager.create_vm_network(task_id)
+        net_info = await net_manager.create_vm_network(
+            task_id, network_names=network_names, reserved_ips=reserved_ips
+        )
+        nic_summary = ", ".join(
+            f"{i.network_name}={i.vm_ip}@{i.bridge_name}"
+            for i in net_info.interfaces
+        )
         logger.info(
-            f"VM VPS {task_id}: network ready - IP={net_info.vm_ip}, "
-            f"mode={net_info.mode}, bridge={net_info.bridge_name}"
+            f"VM VPS {task_id}: network ready - {nic_summary} (mode={net_info.mode})"
         )
 
         # Get runner public key for VM access
