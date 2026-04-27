@@ -376,6 +376,7 @@ def build_user_data(config: CloudInitConfig) -> str:
             "sysctl -w net.ipv4.conf.default.rp_filter=2",
             "echo 'net.ipv4.conf.all.rp_filter=2' >> /etc/sysctl.d/99-kohakuriver.conf",
             "echo 'net.ipv4.conf.default.rp_filter=2' >> /etc/sysctl.d/99-kohakuriver.conf",
+            *build_secondary_nic_route_commands(config),
             "systemctl daemon-reload",
             "systemctl restart sshd || systemctl restart ssh || true",
             "systemctl enable --now kohakuriver-vm-agent",
@@ -425,18 +426,11 @@ def build_user_data(config: CloudInitConfig) -> str:
 def build_network_config(config: CloudInitConfig) -> str:
     """Generate network-config for static IPs (multi-NIC supported).
 
-    Uses MAC address matching instead of a hardcoded device name
-    to avoid issues with PCI-based naming (enp0s2, ens3, etc.).
-
-    Multi-NIC routing strategy:
-    - Primary NIC owns the system default route (in the main table).
-    - Each non-primary NIC gets its OWN routing table with a default
-      route via its gateway, plus a policy rule "from <my_ip> use my table".
-      This way, traffic sourced from a non-primary IP (e.g. responses to
-      inbound connections on the public IP) returns via the same NIC,
-      avoiding asymmetric routing that breaks reverse-path filtering.
-
-    Routing table IDs start at 200 to avoid colliding with system tables.
+    Only sets IP/netmask via netplan; the system default route is set on
+    the primary NIC. Per-NIC source routing for non-primary NICs is added
+    later via runcmd (using `ip rule` / `ip route` directly), because
+    netplan's `routing-policy` syntax has changed between versions and
+    isn't reliably applied across cloud-init/netplan combinations.
     """
     ethernets: dict[str, dict] = {}
     nics = config.get_nics()
@@ -447,22 +441,76 @@ def build_network_config(config: CloudInitConfig) -> str:
             "addresses": [f"{nic.vm_ip}/{nic.prefix_len}"],
         }
         if is_primary:
-            # Primary: standard default route in main table
             entry["routes"] = [{"to": "default", "via": nic.gateway}]
             if nic.dns_servers:
                 entry["nameservers"] = {"addresses": nic.dns_servers}
-        else:
-            # Secondary: per-NIC default route in a dedicated table + policy rule.
-            # netplan 0.107+ supports "table" on routes and "routing-policy".
-            table_id = 200 + i
-            entry["routes"] = [
-                {"to": "default", "via": nic.gateway, "table": table_id}
-            ]
-            entry["routing-policy"] = [{"from": nic.vm_ip, "table": table_id}]
         ethernets[f"vmnic{i}"] = entry
 
     net_config = {"version": 2, "ethernets": ethernets}
     return yaml.dump(net_config, default_flow_style=False)
+
+
+def build_secondary_nic_route_commands(config: CloudInitConfig) -> list[str]:
+    """Generate `ip rule` / `ip route` commands for non-primary NICs.
+
+    For each non-primary NIC we create a dedicated routing table with the
+    NIC's gateway as default, and a policy rule "from <vm_ip> use that
+    table". This makes traffic sourced from the secondary IP return via
+    the secondary NIC instead of the primary's default route — preventing
+    asymmetric routing that would otherwise be filtered by rp_filter.
+
+    These commands run in cloud-init's runcmd phase, after netplan has
+    applied. They're idempotent (delete + add) and persist in
+    /etc/networkd-dispatcher/routable.d so they survive reboots.
+    """
+    cmds: list[str] = []
+    nics = config.get_nics()
+    persist_lines: list[str] = []
+
+    for i, nic in enumerate(nics):
+        is_primary = nic.is_primary or i == 0
+        if is_primary:
+            continue
+        table_id = 200 + i
+        # Idempotent setup
+        cmds.append(
+            f"ip route flush table {table_id} 2>/dev/null || true"
+        )
+        cmds.append(
+            f"ip route add default via {nic.gateway} table {table_id}"
+        )
+        cmds.append(
+            f"ip rule del from {nic.vm_ip} table {table_id} 2>/dev/null || true"
+        )
+        cmds.append(
+            f"ip rule add from {nic.vm_ip} table {table_id}"
+        )
+        persist_lines.append(
+            f"ip route replace default via {nic.gateway} table {table_id}"
+        )
+        persist_lines.append(
+            f"ip rule del from {nic.vm_ip} table {table_id} 2>/dev/null || true"
+        )
+        persist_lines.append(
+            f"ip rule add from {nic.vm_ip} table {table_id}"
+        )
+
+    if persist_lines:
+        # Persist for reboots via networkd-dispatcher
+        script = (
+            "#!/bin/sh\n" + "\n".join(persist_lines) + "\n"
+        )
+        cmds.append("mkdir -p /etc/networkd-dispatcher/routable.d")
+        # heredoc-encode the script atomically
+        cmds.append(
+            "cat > /etc/networkd-dispatcher/routable.d/50-kohakuriver-multinic.sh "
+            "<< 'EOF'\n" + script + "EOF"
+        )
+        cmds.append(
+            "chmod +x /etc/networkd-dispatcher/routable.d/50-kohakuriver-multinic.sh"
+        )
+
+    return cmds
 
 
 async def create_cloud_init_iso(
