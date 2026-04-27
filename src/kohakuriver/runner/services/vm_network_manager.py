@@ -24,7 +24,6 @@ import httpx
 
 from kohakuriver.models.overlay_subnet import OverlaySubnetConfig
 from kohakuriver.runner.config import config
-from kohakuriver.runner.services.overlay_manager import RunnerOverlayManager
 from kohakuriver.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -178,14 +177,25 @@ class VMNetworkManager:
         )
 
         if self._is_overlay:
-            logger.info("VM network: overlay mode -- using kohaku-overlay bridge")
-            # Verify bridge exists
+            # Verify at least one overlay bridge exists. With multi-network,
+            # each overlay has its own bridge (kohaku-{name}); we check the
+            # first configured network's bridge as a sanity probe.
+            net_names = config.get_overlay_network_names()
+            check_bridge = (
+                f"kohaku-{net_names[0]}"[:15]
+                if net_names and net_names[0] != "default"
+                else self.DEFAULT_OVERLAY_BRIDGE
+            )
+            logger.info(
+                f"VM network: overlay mode -- verifying bridge '{check_bridge}'"
+            )
             exists = await asyncio.to_thread(
-                self._check_bridge_exists_sync,
-                RunnerOverlayManager.BRIDGE_NAME,
+                self._check_bridge_exists_sync, check_bridge
             )
             if not exists:
-                raise RuntimeError("Overlay mode but kohaku-overlay bridge not found")
+                raise RuntimeError(
+                    f"Overlay mode but bridge '{check_bridge}' not found"
+                )
         else:
             logger.info("VM network: standard mode -- creating NAT bridge kohaku-br0")
             await asyncio.to_thread(self._setup_nat_bridge_sync)
@@ -432,6 +442,11 @@ class VMNetworkManager:
     # Overlay mode: TAP -> kohaku-overlay, IP from host IPReservationManager
     # =========================================================================
 
+    # Legacy single-overlay bridge name (matches RunnerOverlayManager when
+    # network_name == "default"). Hardcoded here because RunnerOverlayManager
+    # generates it as an instance attribute, not a class constant.
+    DEFAULT_OVERLAY_BRIDGE = "kohaku-overlay"
+
     async def _create_overlay_interface(
         self,
         task_id: int,
@@ -445,6 +460,10 @@ class VMNetworkManager:
         If reserved_ip is provided (from host pre-allocation), use it directly
         and skip the host reservation API call. Otherwise, reserve from host
         IPAM via HTTP.
+
+        On any failure after IP reservation, releases the token so it doesn't
+        leak. The caller is responsible for cleaning up TAPs/IP for any
+        already-completed interfaces in a multi-NIC create.
         """
         token: str | None = None
         if reserved_ip:
@@ -452,39 +471,63 @@ class VMNetworkManager:
         else:
             vm_ip, token = await self._reserve_overlay_ip(task_id, network_name)
 
-        tap_suffix = f"-{network_index}" if network_index > 0 else ""
-        tap_name = _tap_name(task_id, suffix=tap_suffix)
-        mac = _generate_mac(task_id, network_index=network_index)
+        # From here on, ANY failure must release `token` (if it was obtained).
+        try:
+            tap_suffix = f"-{network_index}" if network_index > 0 else ""
+            tap_name = _tap_name(task_id, suffix=tap_suffix)
+            mac = _generate_mac(task_id, network_index=network_index)
 
-        # Resolve bridge for this network. None → legacy default overlay bridge.
-        if network_name:
-            bridge = f"kohaku-{network_name}" if network_name != "default" else RunnerOverlayManager.BRIDGE_NAME
-            gateway = config.get_container_gateway(network_name)
-        else:
-            bridge = RunnerOverlayManager.BRIDGE_NAME
-            gateway = config._overlay_gateway
+            # Resolve bridge for this network. None → legacy default overlay bridge.
+            if network_name and network_name != "default":
+                bridge = f"kohaku-{network_name}"[:15]
+                gateway = config.get_container_gateway(network_name)
+            else:
+                bridge = self.DEFAULT_OVERLAY_BRIDGE
+                gateway = config._overlay_gateway
 
-        await asyncio.to_thread(self._create_tap_sync, tap_name, bridge)
+            await asyncio.to_thread(self._create_tap_sync, tap_name, bridge)
 
-        # Derive prefix from the bridge's IP / subnet
-        prefix_len = await asyncio.to_thread(
-            self._get_bridge_prefix_sync, bridge, gateway
-        )
-        network = ipaddress.IPv4Network(f"{gateway}/{prefix_len}", strict=False)
+            try:
+                # Derive prefix from the bridge's IP / subnet
+                prefix_len = await asyncio.to_thread(
+                    self._get_bridge_prefix_sync, bridge, gateway
+                )
+                network = ipaddress.IPv4Network(
+                    f"{gateway}/{prefix_len}", strict=False
+                )
+            except Exception:
+                # TAP was created but the rest failed — clean up TAP too
+                try:
+                    await asyncio.to_thread(self._delete_tap_sync, tap_name)
+                except Exception as e:
+                    logger.warning(
+                        f"VM {task_id}: rollback delete TAP after prefix failure: {e}"
+                    )
+                raise
 
-        return VMNetworkInterface(
-            network_name=network_name or "default",
-            tap_device=tap_name,
-            mac_address=mac,
-            vm_ip=vm_ip,
-            gateway=gateway,
-            bridge_name=bridge,
-            netmask=str(network.netmask),
-            prefix_len=prefix_len,
-            dns_servers=self.DNS_SERVERS,
-            mode="overlay",
-            reservation_token=token,
-        )
+            return VMNetworkInterface(
+                network_name=network_name or "default",
+                tap_device=tap_name,
+                mac_address=mac,
+                vm_ip=vm_ip,
+                gateway=gateway,
+                bridge_name=bridge,
+                netmask=str(network.netmask),
+                prefix_len=prefix_len,
+                dns_servers=self.DNS_SERVERS,
+                mode="overlay",
+                reservation_token=token,
+            )
+        except Exception:
+            # Release reserved IP on any post-reserve failure
+            if token:
+                try:
+                    await self._release_overlay_ip_token(token)
+                except Exception as e:
+                    logger.warning(
+                        f"VM {task_id}: rollback release IP token after failure: {e}"
+                    )
+            raise
 
     def _get_bridge_prefix_sync(self, bridge_name: str, gateway: str) -> int:
         """Read the prefix length from the bridge's assigned IP."""

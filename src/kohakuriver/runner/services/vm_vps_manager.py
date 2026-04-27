@@ -185,6 +185,10 @@ def _persist_vm_task_state(
                 "vm_ip": iface.vm_ip,
                 "bridge_name": iface.bridge_name,
                 "mode": iface.mode,
+                # Persist reservation_token so cleanup after runner restart
+                # can release runner-side reservations (host auto-allocated
+                # IPs are released via release_by_container on the host).
+                "reservation_token": iface.reservation_token,
             }
             for iface in net_info.interfaces
         ],

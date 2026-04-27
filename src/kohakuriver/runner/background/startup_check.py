@@ -264,7 +264,9 @@ def _recover_network_allocation(net_manager, task_id: int, task_data: dict) -> N
                 prefix_len=task_data.get("prefix_len", 24),
                 dns_servers=[],
                 mode=iface.get("mode", primary_mode),
-                reservation_token=None,  # Tokens aren't persisted; can't release them
+                # Persisted in vm_vps_manager._persist_vm_task_state; lets
+                # cleanup_vm_network release runner-side reservations.
+                reservation_token=iface.get("reservation_token"),
             )
             for iface in persisted_ifaces
         ]
