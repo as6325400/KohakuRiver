@@ -388,6 +388,27 @@ class RunnerOverlayManager:
             # Route may already exist
             logger.debug(f"Overlay route handling: {e}")
 
+    # Class-level registry: network_name → table_id.
+    # Assignments are stable within a process and across runner restarts because
+    # the network setup order is deterministic (driven by host's OVERLAY_NETWORKS list).
+    _table_id_registry: dict[str, int] = {}
+    _next_table_id: int = 100  # 100..199 reserved for KohakuRiver overlay tables
+
+    @classmethod
+    def _get_or_assign_table_id(cls, network_name: str) -> int:
+        """Get a stable, collision-free table ID for a network."""
+        if network_name in cls._table_id_registry:
+            return cls._table_id_registry[network_name]
+        if cls._next_table_id >= 200:
+            raise RuntimeError(
+                "Policy routing table ID pool exhausted (100..199). "
+                "Too many non-masquerade overlay networks."
+            )
+        table_id = cls._next_table_id
+        cls._next_table_id += 1
+        cls._table_id_registry[network_name] = table_id
+        return table_id
+
     def _setup_policy_routing(
         self, config: OverlayConfig, host_gateway: str
     ) -> None:
@@ -405,14 +426,11 @@ class RunnerOverlayManager:
         Result: container outbound → runner bridge → VXLAN → host → WireGuard → internet
         Source IP stays as the public IP (no NAT).
         """
-        import hashlib
-
         overlay_cidr = config.overlay_network_cidr
-        # Stable table ID derived from network name (md5 hash, NOT Python's hash())
-        # Python's hash() is randomized per-process, which would produce
-        # different table IDs across runner restarts and leave orphaned rules.
-        digest = hashlib.md5(self.network_name.encode()).digest()
-        table_id = 100 + (digest[0] % 100)
+        # Sequentially-assigned, collision-free table ID per network name.
+        # Stable across runner restarts because overlay setup order is
+        # deterministic from host's OVERLAY_NETWORKS list.
+        table_id = self._get_or_assign_table_id(self.network_name)
 
         try:
             # Add default route in the policy table
