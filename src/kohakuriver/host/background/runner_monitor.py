@@ -85,6 +85,8 @@ def _mark_node_tasks_lost(node: Node) -> None:
         )
     )
 
+    from kohakuriver.host.services.task_scheduler import schedule_ip_release
+
     for task in tasks_to_fail:
         logger.warning(
             f"Marking task {task.task_id} as 'lost' "
@@ -95,6 +97,7 @@ def _mark_node_tasks_lost(node: Node) -> None:
         task.completed_at = datetime.datetime.now()
         task.exit_code = -1
         task.save()
+        schedule_ip_release(task)
 
 
 def _cleanup_orphaned_pending_tasks() -> None:
@@ -123,6 +126,8 @@ def _cleanup_orphaned_pending_tasks() -> None:
                 & (Task.assigned_node.in_(list(offline_nodes)))
             )
         )
+        from kohakuriver.host.services.task_scheduler import schedule_ip_release
+
         for task in stale_assigned:
             task.status = "failed"
             task.error_message = (
@@ -132,6 +137,7 @@ def _cleanup_orphaned_pending_tasks() -> None:
             task.completed_at = now
             task.exit_code = -1
             task.save()
+            schedule_ip_release(task)
             logger.warning(
                 f"Task {task.task_id} pending on offline node "
                 f"{task.assigned_node} — marked as failed"
@@ -146,6 +152,8 @@ def _cleanup_orphaned_pending_tasks() -> None:
             & (Task.submitted_at < unassigned_timeout)
         )
     )
+    from kohakuriver.host.services.task_scheduler import schedule_ip_release
+
     for task in stale_unassigned:
         task.status = "failed"
         task.error_message = (
@@ -155,6 +163,7 @@ def _cleanup_orphaned_pending_tasks() -> None:
         task.completed_at = now
         task.exit_code = -1
         task.save()
+        schedule_ip_release(task)
         logger.warning(
             f"Task {task.task_id} unassigned and pending for "
             f"{(now - task.submitted_at).total_seconds():.0f}s — marked as failed"

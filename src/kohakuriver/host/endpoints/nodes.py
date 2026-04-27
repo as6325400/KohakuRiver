@@ -307,11 +307,14 @@ def _process_killed_tasks(
         original_status = task.status
         new_status = "killed_oom" if killed_info.reason == "oom" else "failed"
 
+        from kohakuriver.host.services.task_scheduler import schedule_ip_release
+
         task.status = new_status
         task.exit_code = -9
         task.error_message = f"Killed by runner: {killed_info.reason}"
         task.completed_at = now
         task.save()
+        schedule_ip_release(task)
 
         logger.warning(
             f"Task {killed_info.task_id} on {hostname} marked as '{new_status}' "
@@ -381,6 +384,8 @@ def _check_task_assignment_timeout(
             f"Marked as suspect ({task.assignment_suspicion_count})"
         )
     else:
+        from kohakuriver.host.services.task_scheduler import schedule_ip_release
+
         # Mark as failed after too many suspicions
         task.status = "failed"
         task.error_message = (
@@ -390,6 +395,7 @@ def _check_task_assignment_timeout(
         task.completed_at = now
         task.exit_code = -1
         task.save()
+        schedule_ip_release(task)
         logger.error(
             f"Task {task.task_id} (on {hostname}) failed assignment. "
             f"Marked as failed (suspect count: {task.assignment_suspicion_count})"
@@ -432,6 +438,8 @@ def _reconcile_pending_tasks(
         if time_since_submit <= timeout:
             continue
 
+        from kohakuriver.host.services.task_scheduler import schedule_ip_release
+
         # Task has been pending on this runner too long and runner doesn't know it
         task.status = "failed"
         task.error_message = (
@@ -441,6 +449,7 @@ def _reconcile_pending_tasks(
         task.completed_at = now
         task.exit_code = -1
         task.save()
+        schedule_ip_release(task)
         logger.warning(
             f"Task {task.task_id} stuck pending on {hostname} for "
             f"{time_since_submit.total_seconds():.0f}s — marked as failed"

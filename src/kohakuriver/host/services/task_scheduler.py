@@ -5,6 +5,7 @@ Handles task submission, assignment, and control operations.
 Provides communication with runner nodes for task lifecycle management.
 """
 
+import asyncio
 import datetime
 import json
 
@@ -334,6 +335,57 @@ def mark_task_killed(task: Task, message: str = "Kill requested by user.") -> No
     task.completed_at = datetime.datetime.now()
     task.save()
     logger.info(f"Marked task {task.task_id} as 'killed'")
+    schedule_ip_release(task)
+
+
+# Terminal task states — IPs should be released when transitioning into these
+TERMINAL_TASK_STATES = {"completed", "failed", "killed", "killed_oom", "lost", "stopped"}
+
+
+async def release_task_ips(task: Task) -> None:
+    """Release any auto-allocated/reserved IPs bound to a task's container.
+
+    Called when a task transitions to a terminal state (completed/failed/
+    killed/lost/stopped). Safe to call even if the task had no IP
+    reservation — release_by_container is a no-op then.
+    """
+    from kohakuriver.docker.naming import task_container_name, vps_container_name
+    from kohakuriver.host.state import get_ip_reservation_manager
+
+    ip_manager = get_ip_reservation_manager()
+    if not ip_manager:
+        return
+
+    container_name = (
+        vps_container_name(task.task_id)
+        if task.task_type == "vps"
+        else task_container_name(task.task_id)
+    )
+    try:
+        released = await ip_manager.release_by_container(container_name)
+        if released:
+            logger.info(
+                f"Task {task.task_id}: released {len(released)} IP(s) "
+                f"on transition to '{task.status}'"
+            )
+    except Exception as e:
+        logger.warning(f"Task {task.task_id}: IP release failed: {e}")
+
+
+def schedule_ip_release(task: Task) -> None:
+    """Schedule IP release from a sync context.
+
+    Safe to call from sync code that runs inside an async event loop.
+    Falls back to asyncio.run() when no loop is running.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(release_task_ips(task))
+    except RuntimeError:
+        try:
+            asyncio.run(release_task_ips(task))
+        except Exception as e:
+            logger.warning(f"Task {task.task_id}: IP release scheduling failed: {e}")
 
 
 def update_task_status(
@@ -391,6 +443,11 @@ def update_task_status(
 
     task.save()
     logger.info(f"Task {task_id} status updated to {status}")
+
+    # Release any auto-allocated IPs when task hits a terminal state
+    if status in TERMINAL_TASK_STATES:
+        schedule_ip_release(task)
+
     return True
 
 

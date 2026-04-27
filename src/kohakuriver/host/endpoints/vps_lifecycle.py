@@ -217,10 +217,21 @@ async def _auto_allocate_flat_ips_vps(
         )
         if ip:
             allocated[net_name] = ip
-        else:
-            logger.warning(
-                f"Failed to auto-allocate IP for VPS on '{net_name}' / '{target_hostname}'"
-            )
+            continue
+
+        # Rollback: release IPs allocated so far before aborting
+        await ip_manager.release_by_container(container_name)
+        logger.error(
+            f"Auto-allocate failed for VPS flat network '{net_name}' on "
+            f"'{target_hostname}'. Pool exhausted; rolled back {len(allocated)} IP(s)."
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"No available IP in network '{net_name}' on runner "
+                f"'{target_hostname}'. Pool may be exhausted."
+            ),
+        )
 
     return allocated if allocated else None
 
@@ -510,25 +521,14 @@ async def submit_vps(
         ssh_key_mode, submission, task_id
     )
 
-    # Create task record
-    task = _create_vps_task_record(
-        task_id=task_id,
-        submission=submission,
-        ssh_port=ssh_port,
-        node=node,
-        container_name=container_name,
-        vps_backend=vps_backend,
-        ssh_key_mode=ssh_key_mode,
-        current_user=current_user,
-    )
-
     # Resolve networks: prefer network_names list, fall back to network_name
     resolved_networks = submission.network_names or (
         [submission.network_name] if submission.network_name else None
     )
     primary_network = resolved_networks[0] if resolved_networks else None
 
-    # Validate user-supplied IP reservation token (if any)
+    # Validate user-supplied IP reservation token BEFORE creating the task
+    # record so an invalid token doesn't leave an orphan 'assigning' VPS in DB.
     primary_reserved_ip: str | None = None
     if submission.ip_reservation_token:
         ip_manager = get_ip_reservation_manager()
@@ -547,23 +547,46 @@ async def submit_vps(
                 status_code=400,
                 detail="Invalid IP reservation token, expired, or runner/network mismatch",
             )
-        # Mark the reservation as used by this VPS container
         full_container_name = vps_container_name(task_id)
         primary_reserved_ip = await ip_manager.use_reservation(
             submission.ip_reservation_token,
             full_container_name,
             expected_runner=node.hostname,
+            expected_network=primary_network,
         )
+
+    # Create task record (after validation passes — DB stays clean on bad input)
+    task = _create_vps_task_record(
+        task_id=task_id,
+        submission=submission,
+        ssh_port=ssh_port,
+        node=node,
+        container_name=container_name,
+        vps_backend=vps_backend,
+        ssh_key_mode=ssh_key_mode,
+        current_user=current_user,
+    )
 
     # Auto-allocate IPs for flat networks (skipping primary if it has an explicit reservation)
     full_container_name = vps_container_name(task_id)
-    reserved_ips = await _auto_allocate_flat_ips_vps(
-        node.hostname,
-        resolved_networks,
-        full_container_name,
-        primary_reserved_ip=primary_reserved_ip,
-        primary_network_name=primary_network,
-    )
+    try:
+        reserved_ips = await _auto_allocate_flat_ips_vps(
+            node.hostname,
+            resolved_networks,
+            full_container_name,
+            primary_reserved_ip=primary_reserved_ip,
+            primary_network_name=primary_network,
+        )
+    except HTTPException:
+        # Pool exhausted — mark task failed and clean up before re-raising
+        from kohakuriver.host.services.task_scheduler import schedule_ip_release
+
+        task.status = "failed"
+        task.error_message = "IP allocation failed: flat-subnet pool exhausted."
+        task.completed_at = datetime.datetime.now()
+        task.save()
+        schedule_ip_release(task)  # Releases the explicit primary reservation if any
+        raise
 
     # Send to runner
     result = await send_vps_to_runner(
@@ -585,10 +608,13 @@ async def submit_vps(
 
     # Handle runner rejection
     if result is None:
+        from kohakuriver.host.services.task_scheduler import schedule_ip_release
+
         task.status = "failed"
         task.error_message = "Runner rejected VPS creation."
         task.completed_at = datetime.datetime.now()
         task.save()
+        schedule_ip_release(task)
         raise HTTPException(
             status_code=502,
             detail="Runner rejected VPS creation.",
@@ -653,6 +679,8 @@ async def stop_vps(
             detail=f"VPS cannot be stopped (state: {task.status})",
         )
 
+    from kohakuriver.host.services.task_scheduler import schedule_ip_release
+
     original_status = task.status
 
     # Mark as stopped
@@ -660,6 +688,7 @@ async def stop_vps(
     task.error_message = "Stopped by user."
     task.completed_at = datetime.datetime.now()
     task.save()
+    schedule_ip_release(task)
     logger.info(f"Marked VPS {task_id} as 'stopped'.")
 
     # Tell runner to stop the VPS (handles both Docker and VM)
@@ -793,10 +822,13 @@ async def restart_vps(
         )
 
         if result is None:
+            from kohakuriver.host.services.task_scheduler import schedule_ip_release
+
             task.status = "failed"
             task.error_message = "Runner rejected VPS restart."
             task.completed_at = datetime.datetime.now()
             task.save()
+            schedule_ip_release(task)
             raise HTTPException(
                 status_code=502,
                 detail="Runner rejected VPS restart.",

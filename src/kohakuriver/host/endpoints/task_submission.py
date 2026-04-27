@@ -217,6 +217,12 @@ async def _auto_allocate_flat_ips(
     primary_network_name: str | None,
     container_name: str,
 ) -> dict[str, str] | None:
+    """Auto-allocate IPs for flat overlay networks.
+
+    Raises HTTPException(503) if any flat network exhausts its IP pool —
+    the submission is aborted and any IPs allocated up to that point are
+    released so the pool stays consistent.
+    """
     """
     Auto-allocate IPs for flat overlay networks (DHCP-like).
 
@@ -275,10 +281,21 @@ async def _auto_allocate_flat_ips(
         )
         if ip:
             allocated[net_name] = ip
-        else:
-            logger.warning(
-                f"Failed to auto-allocate IP for '{net_name}' on '{target_hostname}'"
-            )
+            continue
+
+        # Rollback: release IPs allocated so far before aborting
+        await ip_manager.release_by_container(container_name)
+        logger.error(
+            f"Auto-allocate failed for flat network '{net_name}' on "
+            f"'{target_hostname}'. Pool exhausted; rolled back {len(allocated)} IP(s)."
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"No available IP in network '{net_name}' on runner "
+                f"'{target_hostname}'. Pool may be exhausted."
+            ),
+        )
 
     return allocated if allocated else None
 
@@ -459,13 +476,24 @@ async def _process_target(
         if req.task_type == "vps"
         else task_container_name(task_id)
     )
-    reserved_ips = await _auto_allocate_flat_ips(
-        target_hostname,
-        resolved_networks,
-        reserved_ip,
-        req.network_name,
-        container_name_for_ip,
-    )
+    try:
+        reserved_ips = await _auto_allocate_flat_ips(
+            target_hostname,
+            resolved_networks,
+            reserved_ip,
+            req.network_name,
+            container_name_for_ip,
+        )
+    except HTTPException:
+        # Pool exhausted — mark task failed and clean up before re-raising
+        from kohakuriver.host.services.task_scheduler import schedule_ip_release
+
+        task.status = "failed"
+        task.error_message = "IP allocation failed: flat-subnet pool exhausted."
+        task.completed_at = datetime.datetime.now()
+        task.save()
+        schedule_ip_release(task)
+        raise
 
     # Dispatch to runner
     runner_response = await _dispatch_task(

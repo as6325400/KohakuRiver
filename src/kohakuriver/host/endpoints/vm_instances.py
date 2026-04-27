@@ -237,10 +237,13 @@ async def delete_vm_instance(
 
     # Update Task DB if task exists with active status and force was used
     if task and force and task.status in ("running", "paused", "assigning"):
+        from kohakuriver.host.services.task_scheduler import schedule_ip_release
+
         task.status = "stopped"
         task.error_message = "Stopped by admin (VM instance cleanup)."
         task.completed_at = datetime.datetime.now()
         task.save()
+        schedule_ip_release(task)
         logger.info(
             f"Marked task {task_id} as stopped after forced VM instance deletion"
         )
