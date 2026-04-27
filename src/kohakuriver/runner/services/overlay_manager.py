@@ -433,15 +433,22 @@ class RunnerOverlayManager:
         table_id = self._get_or_assign_table_id(self.network_name)
 
         try:
-            # Add default route in the policy table
+            # Add default route in the policy table.
+            # `dev BRIDGE` + `onlink` is required: custom routing tables
+            # don't fall through to the main table for next-hop resolution,
+            # so without `onlink` the kernel can't figure out where the
+            # gateway lives and the route becomes unreachable.
             route_cmd = [
                 "ip", "route", "replace", "default",
                 "via", host_gateway,
+                "dev", self.BRIDGE_NAME,
+                "onlink",
                 "table", str(table_id),
             ]
             subprocess.run(route_cmd, check=True, capture_output=True)
             logger.info(
-                f"Policy routing table {table_id}: default via {host_gateway}"
+                f"Policy routing table {table_id}: default via {host_gateway} "
+                f"dev {self.BRIDGE_NAME} onlink"
             )
 
             # Add ip rule: traffic FROM this subnet uses our table
