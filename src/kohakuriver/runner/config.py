@@ -213,11 +213,20 @@ class RunnerConfig:
 
         Returns overlay network if overlay is enabled and configured,
         otherwise returns the default kohakuriver-net.
+
+        Raises:
+            ValueError: If network_name is specified but doesn't exist.
+                Prevents typos from silently routing to the wrong network.
         """
         if hasattr(self, "_overlay_networks") and self._overlay_networks:
-            if network_name and network_name in self._overlay_networks:
-                return self._overlay_networks[network_name]["docker_network"]
-            # Return first configured overlay as default
+            if network_name:
+                if network_name in self._overlay_networks:
+                    return self._overlay_networks[network_name]["docker_network"]
+                raise ValueError(
+                    f"Unknown overlay network '{network_name}'. "
+                    f"Available: {list(self._overlay_networks.keys())}"
+                )
+            # No specific name → first configured overlay
             first = next(iter(self._overlay_networks.values()))
             return first["docker_network"]
 
@@ -227,7 +236,18 @@ class RunnerConfig:
             and hasattr(self, "_overlay_configured")
             and self._overlay_configured
         ):
+            if network_name and network_name != "default":
+                raise ValueError(
+                    f"Unknown overlay network '{network_name}'. "
+                    f"Only 'default' is configured (legacy single-network mode)."
+                )
             return self.OVERLAY_NETWORK_NAME
+
+        if network_name:
+            raise ValueError(
+                f"Unknown overlay network '{network_name}'. "
+                f"Overlay networking is not configured."
+            )
         return self.DOCKER_NETWORK_NAME
 
     def get_container_gateway(self, network_name: str | None = None) -> str:
