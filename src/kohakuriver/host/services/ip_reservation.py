@@ -351,10 +351,85 @@ class IPReservationManager:
 
             return reservation
 
+    async def auto_allocate_ip(
+        self,
+        runner_name: str,
+        network_name: str,
+        container_id: str,
+    ) -> str | None:
+        """
+        Allocate an IP without a user-facing token (DHCP-like).
+
+        Used before dispatching tasks/VPS to runners on flat networks
+        where Docker IPAM can't coordinate across runners. The host picks
+        an available IP and binds it to the container_id so that
+        `release_by_container` can free it when the container exits.
+
+        Args:
+            runner_name: Runner that will host the container
+            network_name: Overlay network name (must be a flat subnet)
+            container_id: Container name/ID (required for cleanup tracking)
+
+        Returns:
+            Allocated IP or None if pool exhausted
+        """
+        if not container_id:
+            raise ValueError("container_id is required for auto_allocate_ip")
+
+        async with self._lock:
+            self._cleanup_expired_sync()
+
+            manager = self._get_manager_for_network(network_name)
+            if not manager:
+                return None
+
+            allocation = manager._allocations.get(runner_name)
+            if not allocation:
+                return None
+
+            available = self._get_available_ips_for_runner(runner_name, network_name)
+            if not available:
+                logger.warning(
+                    f"No available IPs for auto-allocation on '{runner_name}' "
+                    f"network '{network_name}'"
+                )
+                return None
+
+            ip = secrets.choice(available)
+
+            # Create a reservation pre-bound to the container.
+            # Long expiry (1 year) — release happens via release_by_container
+            # when the container exits, not by TTL.
+            expires_at = datetime.now() + timedelta(days=365)
+            reservation = IPReservation(
+                ip=ip,
+                runner_name=runner_name,
+                runner_id=allocation.runner_id,
+                token="",  # No user-facing token
+                network_name=network_name,
+                expires_at=expires_at,
+                container_id=container_id,
+            )
+            key = (network_name, ip)
+            self._reservations[key] = reservation
+
+            # Also mark in _used_ips so other allocations skip it
+            used_key = (runner_name, network_name)
+            if used_key not in self._used_ips:
+                self._used_ips[used_key] = set()
+            self._used_ips[used_key].add(ip)
+
+            logger.info(
+                f"Auto-allocated IP {ip} on '{runner_name}' network '{network_name}' "
+                f"for container {container_id}"
+            )
+            return ip
+
     async def validate_token(
         self,
         token: str,
         expected_runner: str | None = None,
+        expected_network: str | None = None,
     ) -> IPReservation | None:
         """
         Validate a reservation token and return the reservation.
@@ -362,6 +437,7 @@ class IPReservationManager:
         Args:
             token: Reservation token to validate
             expected_runner: If provided, verify token is for this runner
+            expected_network: If provided, verify token is for this network
 
         Returns:
             IPReservation if valid and not expired, None otherwise
@@ -389,6 +465,14 @@ class IPReservationManager:
                 )
                 return None
 
+            # Verify network if specified
+            if expected_network and reservation.network_name != expected_network:
+                logger.warning(
+                    f"Token network mismatch: expected '{expected_network}', "
+                    f"got '{reservation.network_name}'"
+                )
+                return None
+
             # Check if already used
             if reservation.is_used():
                 logger.warning(
@@ -403,6 +487,7 @@ class IPReservationManager:
         token: str,
         container_id: str,
         expected_runner: str | None = None,
+        expected_network: str | None = None,
     ) -> str | None:
         """
         Mark a reservation as used by a container.
@@ -411,6 +496,7 @@ class IPReservationManager:
             token: Reservation token
             container_id: Container ID using this IP
             expected_runner: If provided, verify token is for this runner
+            expected_network: If provided, verify token is for this network
 
         Returns:
             Reserved IP if successful, None otherwise
@@ -430,6 +516,13 @@ class IPReservationManager:
 
             if expected_runner and reservation.runner_name != expected_runner:
                 logger.warning("Token runner mismatch during use")
+                return None
+
+            if expected_network and reservation.network_name != expected_network:
+                logger.warning(
+                    f"Token network mismatch during use: expected "
+                    f"'{expected_network}', got '{reservation.network_name}'"
+                )
                 return None
 
             if reservation.is_used():

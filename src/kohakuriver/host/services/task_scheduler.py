@@ -30,6 +30,7 @@ async def send_task_to_runner(
     registry_image: str | None = None,
     network_name: str | None = None,
     network_names: list[str] | None = None,
+    reserved_ips: dict[str, str] | None = None,
 ) -> dict | None:
     """
     Send task execution request to a runner.
@@ -59,6 +60,7 @@ async def send_task_to_runner(
         "stdout_path": task.stdout_path,
         "stderr_path": task.stderr_path,
         "reserved_ip": reserved_ip,
+        "reserved_ips": reserved_ips,
         "network_name": network_name,
         "network_names": network_names,
     }
@@ -103,6 +105,7 @@ async def send_vps_task_to_runner(
     registry_image: str | None = None,
     network_name: str | None = None,
     network_names: list[str] | None = None,
+    reserved_ips: dict[str, str] | None = None,
 ) -> dict | None:
     """
     Send VPS creation request to a runner.
@@ -128,6 +131,7 @@ async def send_vps_task_to_runner(
         "ssh_public_key": ssh_public_key,
         "ssh_port": task.ssh_port,
         "reserved_ip": reserved_ip,
+        "reserved_ips": reserved_ips,
         "network_name": network_name,
         "network_names": network_names,
     }

@@ -540,7 +540,10 @@ async def _report_task_failure(
 
 
 async def _attach_additional_networks(
-    task_id: int, container_name: str, networks: list[str | None]
+    task_id: int,
+    container_name: str,
+    networks: list[str | None],
+    reserved_ips: dict[str, str] | None = None,
 ) -> None:
     """
     Attach additional Docker networks to a running container.
@@ -549,15 +552,20 @@ async def _attach_additional_networks(
     `docker run --network`, and additional networks are attached here
     via `docker network connect` after the container starts.
 
+    If reserved_ips contains an IP for a network, it's passed via --ip
+    so the container gets the host-allocated address (avoids cross-runner
+    IP conflicts on flat subnets).
+
     Retries briefly because the container may not be ready immediately.
     """
     for net in networks:
         if not net:
             continue
         net_docker_name = config.get_container_network(net)
-        connect_cmd = [
-            "docker", "network", "connect", net_docker_name, container_name
-        ]
+        connect_cmd = ["docker", "network", "connect"]
+        if reserved_ips and net in reserved_ips:
+            connect_cmd.extend(["--ip", reserved_ips[net]])
+        connect_cmd.extend([net_docker_name, container_name])
 
         # Retry up to 3 times with 0.5s delay (container may be initializing)
         for attempt in range(3):
@@ -569,8 +577,13 @@ async def _attach_additional_networks(
                 )
                 _, err = await proc.communicate()
                 if proc.returncode == 0:
+                    ip_info = (
+                        f" with IP {reserved_ips[net]}"
+                        if reserved_ips and net in reserved_ips
+                        else ""
+                    )
                     logger.info(
-                        f"[Task {task_id}] Connected to additional network '{net}'"
+                        f"[Task {task_id}] Connected to additional network '{net}'{ip_info}"
                     )
                     break
                 err_msg = err.decode(errors="replace").strip()
@@ -608,6 +621,7 @@ async def execute_task(
     registry_image: str | None = None,
     network_name: str | None = None,
     network_names: list[str] | None = None,
+    reserved_ips: dict[str, str] | None = None,
 ):
     """
     Execute a task in a Docker container using subprocess.
@@ -707,6 +721,11 @@ async def execute_task(
     primary_network = networks[0]
     additional_networks = networks[1:]  # May be empty
 
+    # If host pre-allocated an IP for the primary network, use it
+    if reserved_ips and primary_network and primary_network in reserved_ips:
+        if not reserved_ip:
+            reserved_ip = reserved_ips[primary_network]
+
     # Build the docker run command
     docker_cmd = build_docker_run_command(
         task_id=task_id,
@@ -771,7 +790,7 @@ async def execute_task(
         if additional_networks:
             asyncio.create_task(
                 _attach_additional_networks(
-                    task_id, container_name_full, additional_networks
+                    task_id, container_name_full, additional_networks, reserved_ips
                 )
             )
 

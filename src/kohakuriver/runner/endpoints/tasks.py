@@ -84,6 +84,7 @@ async def execute_task_endpoint(
         reserved_ip=request.reserved_ip,
         network_name=request.network_name,
         network_names=request.network_names,
+        reserved_ips=request.reserved_ips,
     )
 
     return {"message": "Task accepted for launch", "task_id": task_id}

@@ -19,7 +19,7 @@ from kohakuriver.db.task import Task
 from kohakuriver.host.auth.dependencies import require_user
 from kohakuriver.docker.naming import task_container_name, vps_container_name
 from kohakuriver.host.config import config
-from kohakuriver.host.state import get_ip_reservation_manager
+from kohakuriver.host.state import get_ip_reservation_manager, get_overlay_manager
 from kohakuriver.host.services.node_manager import (
     find_suitable_node,
     get_node_available_cores,
@@ -187,19 +187,100 @@ async def _validate_ip_reservation(
             detail="IP reservation manager not initialized",
         )
 
-    # Validate token and check it's for the target node
+    # The token is for the primary network (first in network_names, or network_name)
+    primary_network = None
+    if req.network_names:
+        primary_network = req.network_names[0]
+    elif req.network_name:
+        primary_network = req.network_name
+
+    # Validate token and check it's for the target node + primary network
     reservation = await ip_manager.validate_token(
         req.ip_reservation_token,
         expected_runner=target_hostname,
+        expected_network=primary_network,
     )
 
     if not reservation:
         raise HTTPException(
             status_code=400,
-            detail="Invalid IP reservation token, expired, or node mismatch",
+            detail="Invalid IP reservation token, expired, or node/network mismatch",
         )
 
     return reservation.ip
+
+
+async def _auto_allocate_flat_ips(
+    target_hostname: str,
+    network_names: list[str] | None,
+    primary_reserved_ip: str | None,
+    primary_network_name: str | None,
+    container_name: str,
+) -> dict[str, str] | None:
+    """
+    Auto-allocate IPs for flat overlay networks (DHCP-like).
+
+    For flat subnets shared across multiple runners (e.g., a public /26),
+    Docker IPAM on each runner can't see other runners' allocations and may
+    pick a colliding IP. This function reserves IPs at the host before
+    dispatch so each container gets a guaranteed-unique IP.
+
+    Hierarchical subnets (per-runner /18 etc.) don't need this — Docker
+    IPAM is safe within a runner's exclusive subnet.
+
+    Args:
+        target_hostname: Runner that will host the container
+        network_names: List of overlay networks the container will join
+        primary_reserved_ip: IP from explicit reservation token (if any)
+        primary_network_name: Network the explicit reservation is for
+
+    Returns:
+        {network_name: ip} for auto-allocated IPs, or None if not needed.
+        Excludes the primary network if it already has an explicit reservation.
+    """
+    if not network_names:
+        return None
+
+    multi_manager = get_overlay_manager()
+    if not multi_manager:
+        return None
+
+    ip_manager = get_ip_reservation_manager()
+    if not ip_manager:
+        return None
+
+    allocated: dict[str, str] = {}
+
+    for idx, net_name in enumerate(network_names):
+        # Skip primary network if it already has an explicit reservation
+        if (
+            idx == 0
+            and primary_reserved_ip
+            and (not primary_network_name or primary_network_name == net_name)
+        ):
+            allocated[net_name] = primary_reserved_ip
+            continue
+
+        manager = multi_manager.get_manager(net_name)
+        if not manager:
+            logger.warning(f"Network '{net_name}' not found, skipping IP allocation")
+            continue
+
+        # Only auto-allocate for flat subnets
+        if not manager.subnet_config.is_flat:
+            continue
+
+        ip = await ip_manager.auto_allocate_ip(
+            target_hostname, net_name, container_name
+        )
+        if ip:
+            allocated[net_name] = ip
+        else:
+            logger.warning(
+                f"Failed to auto-allocate IP for '{net_name}' on '{target_hostname}'"
+            )
+
+    return allocated if allocated else None
 
 
 def _validate_submission(req: TaskSubmission) -> None:
@@ -355,10 +436,16 @@ async def _process_target(
                 if req.task_type == "vps"
                 else task_container_name(task_id)
             )
+            primary_network = (
+                req.network_names[0]
+                if req.network_names
+                else req.network_name
+            )
             await ip_manager.use_reservation(
                 req.ip_reservation_token,
                 container_name,
                 expected_runner=target_hostname,
+                expected_network=primary_network,
             )
 
     # Resolve networks: prefer network_names list, fall back to network_name
@@ -366,9 +453,30 @@ async def _process_target(
         [req.network_name] if req.network_name else None
     )
 
+    # Auto-allocate IPs for flat networks (DHCP-like coordination across runners)
+    container_name_for_ip = (
+        vps_container_name(task_id)
+        if req.task_type == "vps"
+        else task_container_name(task_id)
+    )
+    reserved_ips = await _auto_allocate_flat_ips(
+        target_hostname,
+        resolved_networks,
+        reserved_ip,
+        req.network_name,
+        container_name_for_ip,
+    )
+
     # Dispatch to runner
     runner_response = await _dispatch_task(
-        task, node, req, task_config, reserved_ip, req.network_name, resolved_networks
+        task,
+        node,
+        req,
+        task_config,
+        reserved_ip,
+        req.network_name,
+        resolved_networks,
+        reserved_ips,
     )
 
     if runner_response is False:
@@ -534,6 +642,7 @@ async def _dispatch_task(
     reserved_ip: str | None = None,
     network_name: str | None = None,
     network_names: list[str] | None = None,
+    reserved_ips: dict[str, str] | None = None,
 ) -> dict | bool | None:
     """Dispatch task to runner node."""
     if req.task_type == "vps":
@@ -546,6 +655,7 @@ async def _dispatch_task(
             registry_image=task_config.get("registry_image"),
             network_name=network_name,
             network_names=network_names,
+            reserved_ips=reserved_ips,
         )
         if result is None:
             task.status = "failed"
@@ -566,6 +676,7 @@ async def _dispatch_task(
                 registry_image=task_config.get("registry_image"),
                 network_name=network_name,
                 network_names=network_names,
+                reserved_ips=reserved_ips,
             )
         )
         background_tasks.add(dispatch_task)

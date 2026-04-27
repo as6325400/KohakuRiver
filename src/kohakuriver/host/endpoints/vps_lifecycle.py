@@ -21,6 +21,7 @@ from kohakuriver.db.task import Task
 from kohakuriver.docker.naming import vps_container_name
 from kohakuriver.host.auth.dependencies import require_operator
 from kohakuriver.host.config import config
+from kohakuriver.host.state import get_ip_reservation_manager, get_overlay_manager
 from kohakuriver.host.services.node_manager import (
     find_suitable_node,
     find_suitable_node_for_vm,
@@ -95,6 +96,8 @@ async def send_vps_to_runner(
     memory_mb: int | None = None,
     network_name: str | None = None,
     network_names: list[str] | None = None,
+    reserved_ip: str | None = None,
+    reserved_ips: dict[str, str] | None = None,
 ) -> dict | None:
     """
     Send VPS creation request to a runner.
@@ -128,6 +131,8 @@ async def send_vps_to_runner(
         "vps_backend": vps_backend,
         "network_name": network_name,
         "network_names": network_names,
+        "reserved_ip": reserved_ip,
+        "reserved_ips": reserved_ips,
     }
 
     # Add VM-specific fields
@@ -162,6 +167,62 @@ async def send_vps_to_runner(
         )
         # Return None only for explicit rejection from runner
         return None
+
+
+async def _auto_allocate_flat_ips_vps(
+    target_hostname: str,
+    network_names: list[str] | None,
+    container_name: str,
+    primary_reserved_ip: str | None = None,
+    primary_network_name: str | None = None,
+) -> dict[str, str] | None:
+    """
+    Auto-allocate IPs for flat overlay networks for a VPS.
+
+    Mirrors task_submission's _auto_allocate_flat_ips. Hierarchical
+    subnets are skipped (Docker IPAM is safe within per-runner subnets).
+
+    If primary_reserved_ip is set (from a user-supplied token), it's used
+    for the primary network instead of auto-allocating.
+    """
+    if not network_names:
+        return None
+
+    multi_manager = get_overlay_manager()
+    if not multi_manager:
+        return None
+
+    ip_manager = get_ip_reservation_manager()
+    if not ip_manager:
+        return None
+
+    allocated: dict[str, str] = {}
+    for idx, net_name in enumerate(network_names):
+        # Skip primary if it already has an explicit reservation
+        if (
+            idx == 0
+            and primary_reserved_ip
+            and (not primary_network_name or primary_network_name == net_name)
+        ):
+            allocated[net_name] = primary_reserved_ip
+            continue
+
+        manager = multi_manager.get_manager(net_name)
+        if not manager:
+            continue
+        if not manager.subnet_config.is_flat:
+            continue
+        ip = await ip_manager.auto_allocate_ip(
+            target_hostname, net_name, container_name
+        )
+        if ip:
+            allocated[net_name] = ip
+        else:
+            logger.warning(
+                f"Failed to auto-allocate IP for VPS on '{net_name}' / '{target_hostname}'"
+            )
+
+    return allocated if allocated else None
 
 
 def allocate_ssh_port() -> int:
@@ -461,6 +522,49 @@ async def submit_vps(
         current_user=current_user,
     )
 
+    # Resolve networks: prefer network_names list, fall back to network_name
+    resolved_networks = submission.network_names or (
+        [submission.network_name] if submission.network_name else None
+    )
+    primary_network = resolved_networks[0] if resolved_networks else None
+
+    # Validate user-supplied IP reservation token (if any)
+    primary_reserved_ip: str | None = None
+    if submission.ip_reservation_token:
+        ip_manager = get_ip_reservation_manager()
+        if not ip_manager:
+            raise HTTPException(
+                status_code=500,
+                detail="IP reservation manager not initialized",
+            )
+        reservation = await ip_manager.validate_token(
+            submission.ip_reservation_token,
+            expected_runner=node.hostname,
+            expected_network=primary_network,
+        )
+        if not reservation:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid IP reservation token, expired, or runner/network mismatch",
+            )
+        # Mark the reservation as used by this VPS container
+        full_container_name = vps_container_name(task_id)
+        primary_reserved_ip = await ip_manager.use_reservation(
+            submission.ip_reservation_token,
+            full_container_name,
+            expected_runner=node.hostname,
+        )
+
+    # Auto-allocate IPs for flat networks (skipping primary if it has an explicit reservation)
+    full_container_name = vps_container_name(task_id)
+    reserved_ips = await _auto_allocate_flat_ips_vps(
+        node.hostname,
+        resolved_networks,
+        full_container_name,
+        primary_reserved_ip=primary_reserved_ip,
+        primary_network_name=primary_network,
+    )
+
     # Send to runner
     result = await send_vps_to_runner(
         runner_url=node.url,
@@ -475,6 +579,8 @@ async def submit_vps(
         memory_mb=submission.memory_mb,
         network_name=submission.network_name,
         network_names=submission.network_names,
+        reserved_ip=primary_reserved_ip,
+        reserved_ips=reserved_ips,
     )
 
     # Handle runner rejection

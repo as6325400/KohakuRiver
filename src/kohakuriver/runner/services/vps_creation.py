@@ -457,6 +457,7 @@ async def create_vps(
     registry_image: str | None = None,
     network_name: str | None = None,
     network_names: list[str] | None = None,
+    reserved_ips: dict[str, str] | None = None,
 ) -> dict:
     """
     Create a VPS container with SSH access using subprocess.
@@ -555,6 +556,11 @@ async def create_vps(
     primary_network = networks[0]
     additional_networks = networks[1:]  # May be empty
 
+    # If host pre-allocated an IP for the primary network, use it
+    if reserved_ips and primary_network and primary_network in reserved_ips:
+        if not reserved_ip:
+            reserved_ip = reserved_ips[primary_network]
+
     docker_cmd = _build_vps_docker_command(
         docker_image_tag=docker_image_tag,
         task_id=task_id,
@@ -602,9 +608,10 @@ async def create_vps(
             if not net:
                 continue
             net_docker_name = config.get_container_network(net)
-            connect_cmd = [
-                "docker", "network", "connect", net_docker_name, container_name_full
-            ]
+            connect_cmd = ["docker", "network", "connect"]
+            if reserved_ips and net in reserved_ips:
+                connect_cmd.extend(["--ip", reserved_ips[net]])
+            connect_cmd.extend([net_docker_name, container_name_full])
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *connect_cmd,
@@ -613,8 +620,13 @@ async def create_vps(
                 )
                 _, conn_err = await proc.communicate()
                 if proc.returncode == 0:
+                    ip_info = (
+                        f" with IP {reserved_ips[net]}"
+                        if reserved_ips and net in reserved_ips
+                        else ""
+                    )
                     logger.info(
-                        f"VPS {task_id}: connected to additional network '{net}'"
+                        f"VPS {task_id}: connected to additional network '{net}'{ip_info}"
                     )
                 else:
                     logger.error(
