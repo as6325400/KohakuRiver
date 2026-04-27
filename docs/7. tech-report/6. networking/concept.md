@@ -325,6 +325,18 @@ kohakuriver vps create --network private --network public --ssh
 
 Internally, the Runner runs `docker run --network kohakuriver-private ...` for the primary network, then `docker network connect kohakuriver-public <container>` to attach each additional network.
 
+### Known Limitation: Additional-Network Attach Race
+
+For **command tasks** (`docker run --rm`), the additional-network attach happens in the background **after** the container is already running. This means:
+
+- If your command starts immediately and depends on the second NIC (e.g., binds to it on startup), it may fail to bind because the interface isn't there yet.
+- Connect failures are logged but don't abort the task.
+
+**Mitigation:**
+- The runner retries the attach 3 times with 0.5s delay.
+- For workloads that require multi-NIC at startup, prefer **VPS tasks** which use detached containers — the attach completes before any service inside the container would notice (containers typically initialize for several seconds before bringing up listeners).
+- For latency-critical multi-NIC needs, sleep briefly inside your script (e.g., `sleep 2`) before binding, or check with `ip a` for the expected interface.
+
 ---
 
 ## Masquerade Modes
