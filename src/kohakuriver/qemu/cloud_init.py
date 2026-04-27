@@ -369,6 +369,13 @@ def build_user_data(config: CloudInitConfig) -> str:
             "mkdir -p /shared /local_temp",
             "mount -t 9p -o trans=virtio,version=9p2000.L,msize=524288 kohaku_shared /shared || true",
             "mount -t 9p -o trans=virtio,version=9p2000.L,msize=524288 kohaku_local /local_temp || true",
+            # Multi-NIC support: use loose reverse-path filtering so that
+            # asymmetric routing (e.g. inbound on public NIC, reply via
+            # private default route, or vice versa) doesn't get dropped.
+            "sysctl -w net.ipv4.conf.all.rp_filter=2",
+            "sysctl -w net.ipv4.conf.default.rp_filter=2",
+            "echo 'net.ipv4.conf.all.rp_filter=2' >> /etc/sysctl.d/99-kohakuriver.conf",
+            "echo 'net.ipv4.conf.default.rp_filter=2' >> /etc/sysctl.d/99-kohakuriver.conf",
             "systemctl daemon-reload",
             "systemctl restart sshd || systemctl restart ssh || true",
             "systemctl enable --now kohakuriver-vm-agent",
@@ -420,11 +427,16 @@ def build_network_config(config: CloudInitConfig) -> str:
 
     Uses MAC address matching instead of a hardcoded device name
     to avoid issues with PCI-based naming (enp0s2, ens3, etc.).
-    Uses 'routes' instead of deprecated 'gateway4'.
 
-    Only the primary NIC (first in nics list, or is_primary=True) gets the
-    default route. Additional NICs only get the IP/netmask, so they're
-    addressable but the VM's default route stays on the primary.
+    Multi-NIC routing strategy:
+    - Primary NIC owns the system default route (in the main table).
+    - Each non-primary NIC gets its OWN routing table with a default
+      route via its gateway, plus a policy rule "from <my_ip> use my table".
+      This way, traffic sourced from a non-primary IP (e.g. responses to
+      inbound connections on the public IP) returns via the same NIC,
+      avoiding asymmetric routing that breaks reverse-path filtering.
+
+    Routing table IDs start at 200 to avoid colliding with system tables.
     """
     ethernets: dict[str, dict] = {}
     nics = config.get_nics()
@@ -435,9 +447,18 @@ def build_network_config(config: CloudInitConfig) -> str:
             "addresses": [f"{nic.vm_ip}/{nic.prefix_len}"],
         }
         if is_primary:
+            # Primary: standard default route in main table
             entry["routes"] = [{"to": "default", "via": nic.gateway}]
             if nic.dns_servers:
                 entry["nameservers"] = {"addresses": nic.dns_servers}
+        else:
+            # Secondary: per-NIC default route in a dedicated table + policy rule.
+            # netplan 0.107+ supports "table" on routes and "routing-policy".
+            table_id = 200 + i
+            entry["routes"] = [
+                {"to": "default", "via": nic.gateway, "table": table_id}
+            ]
+            entry["routing-policy"] = [{"from": nic.vm_ip, "table": table_id}]
         ethernets[f"vmnic{i}"] = entry
 
     net_config = {"version": 2, "ethernets": ethernets}
