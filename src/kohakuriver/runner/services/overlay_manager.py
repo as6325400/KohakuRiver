@@ -405,9 +405,14 @@ class RunnerOverlayManager:
         Result: container outbound → runner bridge → VXLAN → host → WireGuard → internet
         Source IP stays as the public IP (no NAT).
         """
+        import hashlib
+
         overlay_cidr = config.overlay_network_cidr
-        # Use a stable table ID derived from the network name
-        table_id = 100 + abs(hash(self.network_name)) % 100
+        # Stable table ID derived from network name (md5 hash, NOT Python's hash())
+        # Python's hash() is randomized per-process, which would produce
+        # different table IDs across runner restarts and leave orphaned rules.
+        digest = hashlib.md5(self.network_name.encode()).digest()
+        table_id = 100 + (digest[0] % 100)
 
         try:
             # Add default route in the policy table
