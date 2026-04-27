@@ -453,14 +453,19 @@ def build_network_config(config: CloudInitConfig) -> str:
 def build_secondary_nic_route_commands(config: CloudInitConfig) -> list[str]:
     """Generate `ip rule` / `ip route` commands for non-primary NICs.
 
-    For each non-primary NIC we create a dedicated routing table with the
-    NIC's gateway as default, and a policy rule "from <vm_ip> use that
-    table". This makes traffic sourced from the secondary IP return via
-    the secondary NIC instead of the primary's default route — preventing
-    asymmetric routing that would otherwise be filtered by rp_filter.
+    For each non-primary NIC we create a dedicated routing table with:
+      1. The connected /prefix route (so the gateway is resolvable)
+      2. A default route via the gateway
+      3. A policy rule "from <vm_ip> use that table"
 
-    These commands run in cloud-init's runcmd phase, after netplan has
-    applied. They're idempotent (delete + add) and persist in
+    Both routes need an explicit device — without it, policy-routed
+    lookups don't fall through to the main table for next-hop resolution
+    and the kernel ends up ARPing the destination directly.
+
+    The device name varies (enp0s2/ens3/etc.), so we look it up at
+    runtime by matching the secondary IP via `ip -o addr show`.
+
+    Commands run in cloud-init runcmd and are also dropped into
     /etc/networkd-dispatcher/routable.d so they survive reboots.
     """
     cmds: list[str] = []
@@ -472,36 +477,37 @@ def build_secondary_nic_route_commands(config: CloudInitConfig) -> list[str]:
         if is_primary:
             continue
         table_id = 200 + i
-        # Idempotent setup
-        cmds.append(
-            f"ip route flush table {table_id} 2>/dev/null || true"
-        )
-        cmds.append(
-            f"ip route add default via {nic.gateway} table {table_id}"
-        )
-        cmds.append(
-            f"ip rule del from {nic.vm_ip} table {table_id} 2>/dev/null || true"
-        )
-        cmds.append(
-            f"ip rule add from {nic.vm_ip} table {table_id}"
-        )
-        persist_lines.append(
-            f"ip route replace default via {nic.gateway} table {table_id}"
-        )
-        persist_lines.append(
-            f"ip rule del from {nic.vm_ip} table {table_id} 2>/dev/null || true"
-        )
-        persist_lines.append(
-            f"ip rule add from {nic.vm_ip} table {table_id}"
+        ip = nic.vm_ip
+        prefix = nic.prefix_len
+        # Compute network address from IP/prefix for the connected route
+        import ipaddress
+
+        network = ipaddress.IPv4Network(f"{ip}/{prefix}", strict=False)
+        cidr = str(network)
+
+        # Resolve the device name at runtime by matching the IP. This is the
+        # interface that holds the secondary IP, regardless of naming
+        # convention (enp0s3, ens4, etc.).
+        dev_lookup = (
+            f"ip -o -4 addr show | grep -F ' {ip}/' | awk '{{print $2}}'"
         )
 
+        block = [
+            f'DEV=$({dev_lookup}); '
+            f'if [ -n "$DEV" ]; then '
+            f'ip route flush table {table_id} 2>/dev/null || true; '
+            f'ip route add {cidr} dev "$DEV" src {ip} table {table_id}; '
+            f'ip route add default via {nic.gateway} dev "$DEV" table {table_id}; '
+            f'ip rule del from {ip} table {table_id} 2>/dev/null || true; '
+            f'ip rule add from {ip} table {table_id}; '
+            f'fi'
+        ]
+        cmds.extend(block)
+        persist_lines.extend(block)
+
     if persist_lines:
-        # Persist for reboots via networkd-dispatcher
-        script = (
-            "#!/bin/sh\n" + "\n".join(persist_lines) + "\n"
-        )
+        script = "#!/bin/sh\n" + "\n".join(persist_lines) + "\n"
         cmds.append("mkdir -p /etc/networkd-dispatcher/routable.d")
-        # heredoc-encode the script atomically
         cmds.append(
             "cat > /etc/networkd-dispatcher/routable.d/50-kohakuriver-multinic.sh "
             "<< 'EOF'\n" + script + "EOF"
