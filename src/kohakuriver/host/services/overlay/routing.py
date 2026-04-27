@@ -44,8 +44,20 @@ def setup_host_routing_sync(
             "Ensure net.ipv4.ip_forward=1 is set."
         )
 
-    # Create dummy interface for host overlay IP
-    # This gives containers a consistent IP to reach the host
+    # Create dummy interface for host overlay IP (hierarchical only).
+    # For flat networks, the host_ip equals the per-runner host_ip_on_runner_subnet,
+    # so adding it to the dummy interface conflicts with the VXLAN interface
+    # that has the same IP — the kernel may route reply traffic to the dummy
+    # (a black hole) instead of the VXLAN. Skip the dummy entirely for flat subnets.
+    if subnet_config.is_flat:
+        logger.info(
+            f"Host routing for '{network_name}' (flat subnet): "
+            f"skipping dummy interface; VXLAN interfaces own the host IP"
+        )
+        # Set up iptables rules and return
+        setup_iptables_rules_sync(subnet_config, masquerade=masquerade)
+        return
+
     dummy_name = "kohaku-host"
 
     # Check if dummy exists
