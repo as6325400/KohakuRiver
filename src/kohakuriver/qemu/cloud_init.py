@@ -478,12 +478,6 @@ def build_secondary_nic_route_commands(config: CloudInitConfig) -> list[str]:
             continue
         table_id = 200 + i
         ip = nic.vm_ip
-        prefix = nic.prefix_len
-        # Compute network address from IP/prefix for the connected route
-        import ipaddress
-
-        network = ipaddress.IPv4Network(f"{ip}/{prefix}", strict=False)
-        cidr = str(network)
 
         # Resolve the device name at runtime by matching the IP. This is the
         # interface that holds the secondary IP, regardless of naming
@@ -492,14 +486,17 @@ def build_secondary_nic_route_commands(config: CloudInitConfig) -> list[str]:
             f"ip -o -4 addr show | grep -F ' {ip}/' | awk '{{print $2}}'"
         )
 
+        # Use `replace` (idempotent) and `onlink` (tells kernel the gateway
+        # is reachable on the device without needing a connected route in
+        # this custom table — custom tables don't fall through to main
+        # for gateway resolution).
         block = [
             f'DEV=$({dev_lookup}); '
             f'if [ -n "$DEV" ]; then '
-            f'ip route flush table {table_id} 2>/dev/null || true; '
-            f'ip route add {cidr} dev "$DEV" src {ip} table {table_id}; '
-            f'ip route add default via {nic.gateway} dev "$DEV" table {table_id}; '
+            f'ip route replace default via {nic.gateway} dev "$DEV" onlink table {table_id}; '
             f'ip rule del from {ip} table {table_id} 2>/dev/null || true; '
             f'ip rule add from {ip} table {table_id}; '
+            f'else echo "kohakuriver: device for {ip} not found, skipping policy routing"; '
             f'fi'
         ]
         cmds.extend(block)
